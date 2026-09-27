@@ -14,14 +14,14 @@ swing_wn = 0.0         # rad/s
 m_wheels = 0.05        # kg, both wheels incl. tires and rotors
 # Roller485 speed loop modelled as first order: psi'' = (u - psi') / motor_tau.
 # Identified with `pend fit-step` (wheels in the air).
-motor_tau = 0.01966       # s
+motor_tau = 0.033       # s
 # Measured speed loop (`pend fit-step --update`): second order with a zero and
 # dead time. Used to verify / optimise the gains. motor_wn = 0 disables it.
-motor_k = 0.9799
-motor_wn = 50.87         # rad/s
-motor_zeta = 0.4634
-motor_tz = 0.07954         # s
-motor_delay = 2        # samples
+motor_k = 0.8579
+motor_wn = 7.469         # rad/s
+motor_zeta = 2.109
+motor_tz = 0.5424         # s
+motor_delay = 0        # samples
 
 [control]
 dt = 0.01              # s, must match kDtUs in firmware/src/main.cpp

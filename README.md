@@ -51,6 +51,20 @@ uvx platformio run -d firmware -t upload --upload-port PORT   # ファームウ�
 
 ## 手順
 
+### 0. Roller の速度 PID を User-Def にする（最初に1回だけ）
+
+Roller485 には速度 PID のプリセット（User-Def / Light / Mid / Heavy Load）があり、Roller 本体のメニューで選ぶ。
+**User-Def 以外が選ばれていると、I2C で書いた PID は保存されるだけで制御には使われない**（読み出しも常にプリセットの値になる）。
+工場出荷時や過去の設定で Heavy Load などになっていることがある。
+
+1. Roller のボタンを押したまま電源を入れる → 設定メニューが開く
+2. 車輪（モーター軸）を回してカーソルを動かし、`SPEED PID` でボタンを押す
+3. `User-Def` を選んでボタンを押す（Roller のフラッシュに保存される）
+4. `Quit` で抜ける。左右 2 台とも行う
+
+FIRE は起動時に `SPID` の値（既定は参考記事と同じ `200000 0 85000000` = P2 I0 D850）を両方の Roller に書き込む。
+Roller の既定 PID（P25 I3e-6 D400）では速度ステップに 2〜3 倍のオーバーシュートと 20 ms の遅れがあり、倒立は安定しない。
+
 ### 1. 接続確認
 
 ```bash
@@ -79,8 +93,14 @@ LCD を見ながら確認する。
 ```bash
 # モーター: 車輪を浮かせた状態で速度ステップ
 uv run pend log PORT -d 3 -k step -c "STEP 10 1.0"
-uv run pend fit-step logs/<file>_step.csv --update      # motor_tau
+uv run pend fit-step logs/<file>_step.csv --update      # motor_tau と実測モデル (motor_k/wn/zeta/tz/delay)
+
+# 速度 PID をいくつか試して比べる（終わると元の PID に戻す）
+uv run pend step-sweep PORT                              # --pid "P I D" で候補を指定できる
 ```
+
+`fit-step` は速度ループを「零点付き2次系＋むだ時間」で当てはめる。`pend design` はこの実測モデルでも安定性を確認し、
+LQR ゲインが不安定なら、実測モデル上で 4 つのゲインを最適化し直す。
 
 質量 `m_body`, `m_wheels`、重心高さ `l`、慣性 `J_body` は `params.toml` に実測値や推定値を書く。
 `J_body` は、車輪を固定して機体を逆さに吊るし、自由振動させると測れる（`pend fit-swing ... --update` で `swing_wn` を書き込む）。
@@ -121,6 +141,7 @@ uv run pend plot logs/<file>_run.csv
 | `R` `TRIM` `TC` `TF` `UMAX` `THLIM` `XLIM` `ARMW` `IMAX` | 車輪半径[m], 直立時の傾き[deg], 相補フィルタ時定数[s], 微分フィルタ[s], 速度上限[rad/s], 角度[deg]/走行距離[m]リミット, 開始窓[deg], 最大電流[mA] |
 | `GET` / `SAVE` | パラメータ表示 / フラッシュ保存 |
 | `INFO` | Roller / IMU の状態表示 |
+| `SPID` / `SPID p i d` | Roller の速度 PID の読み出し / 書き込み（生の値。P/1e5, I/1e7, D/1e5）。`SAVE` すると起動時に再送 |
 | `SETADDR old new` | Roller の I2C アドレス変更（変更する1台だけをつなぐこと） |
 | `SETUP` | Roller のモードを再設定 |
 

@@ -39,14 +39,11 @@ class Roller {
     return wire_.endTransmission() == 0;
   }
 
-  bool write(uint8_t reg, const void* data, size_t len) { return writeStatus(reg, data, len) == 0; }
-
-  // Returns Wire::endTransmission() status (0 = ACK).
-  uint8_t writeStatus(uint8_t reg, const void* data, size_t len) {
+  bool write(uint8_t reg, const void* data, size_t len) {
     wire_.beginTransmission(addr_);
     wire_.write(reg);
     wire_.write(static_cast<const uint8_t*>(data), len);
-    return wire_.endTransmission();
+    return wire_.endTransmission() == 0;
   }
 
   bool read(uint8_t reg, void* data, size_t len) {

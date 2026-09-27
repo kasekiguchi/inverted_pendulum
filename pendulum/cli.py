@@ -61,8 +61,9 @@ def cmd_design(a):
     if p.has_motor2:
         print(f"measured motor model: wn={p.motor_wn:.1f} rad/s zeta={p.motor_zeta:.2f} "
               f"tz={p.motor_tz * 1e3:.0f} ms delay={p.motor_delay} samples")
-        print_poles(closed_loop_poles(p, K, True, p.motor_delay), p.dt, "  LQR gain on the measured model")
-        if not a.lqr_only:
+        z_meas = closed_loop_poles(p, K, True, p.motor_delay)
+        print_poles(z_meas, p.dt, "  LQR gain on the measured model")
+        if np.max(np.abs(z_meas)) >= 0.999 and not a.lqr_only or a.optimize:
             try:
                 K = design_output_feedback(p, K)
             except RuntimeError as e:
@@ -196,10 +197,11 @@ def cmd_fit_step(a):
     r2 = ident.fit_step2(t, u, p)
     print(f"second order: k = {r2['k']:.3f}, wn = {r2['wn']:.1f} rad/s, zeta = {r2['zeta']:.3f}, "
           f"tz = {r2['tz'] * 1e3:.1f} ms, delay = {r2['delay_steps']} samples, fit rms = {np.rad2deg(r2['rms']):.2f} deg")
+    print(f"              overshoot {step_overshoot(r2):.2f}x, 63% rise {step_t63(r2) * 1e3:.0f} ms")
     if a.update:
         # the design model is first order; take its time constant from the second-order fit's
         # 63 % rise so a wrong first-order fit (e.g. tau at the bound) does not leak in.
-        tau = max(r1["tau"], 1.0 / r2["wn"])
+        tau = step_t63(r2)
         update_toml(a.params, {"motor_tau": tau, "motor_k": r2["k"], "motor_wn": r2["wn"],
                                "motor_zeta": r2["zeta"], "motor_tz": r2["tz"],
                                "motor_delay": int(r2["delay_steps"])})
@@ -218,13 +220,24 @@ def cmd_fit_step(a):
     plt.show()
 
 
-def step_overshoot(r: dict) -> float:
-    """Peak / final value of the fitted speed-loop step response."""
+def fitted_step(r: dict):
     from scipy.signal import lti, step
 
     wn, z, tz, k = r["wn"], r["zeta"], r["tz"], r["k"]
-    _, y = step(lti([k * wn**2 * tz, k * wn**2], [1, 2 * z * wn, wn**2]), N=2000)
+    sys = lti([k * wn**2 * tz, k * wn**2], [1, 2 * z * wn, wn**2])
+    return step(sys, T=np.linspace(0, 3.0, 6001))
+
+
+def step_overshoot(r: dict) -> float:
+    """Peak / final value of the fitted speed-loop step response."""
+    _, y = fitted_step(r)
     return float(y.max() / y[-1])
+
+
+def step_t63(r: dict) -> float:
+    """Time to reach 63 % of the final value (equivalent first-order time constant)."""
+    t, y = fitted_step(r)
+    return float(t[np.argmax(y >= 0.632 * y[-1])])
 
 
 DEFAULT_SWEEP = [
@@ -278,6 +291,8 @@ def main(argv=None):
     s.add_argument("--save", action="store_true", help="also SAVE to device flash")
     s.add_argument("--no-plot", action="store_true")
     s.add_argument("--lqr-only", action="store_true", help="skip the optimisation on the measured motor model")
+    s.add_argument("--optimize", action="store_true",
+                   help="optimise the gains on the measured motor model even if the LQR gain is stable on it")
     s.set_defaults(func=cmd_design)
 
     s = sub.add_parser("term", help="interactive serial console")

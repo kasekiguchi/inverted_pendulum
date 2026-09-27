@@ -51,6 +51,9 @@ struct Params {
   float x_limit = 1.0f;         // abort when wheel travel exceeds this [m]
   float arm_window_deg = 3.0f;  // start balancing when |th| gets within this
   int32_t max_current_ma = 1200;
+  // Roller speed PID (raw register values), sent at boot. Only takes effect when
+  // the roller's own menu has SPEED PID = User-Def. Default: Qiita article values.
+  uint32_t speed_pid[3] = {200000, 0, 85000000};
 };
 
 enum class State : uint8_t { kIdle = 0, kArmed = 1, kRun = 2, kStep = 3 };
@@ -99,9 +102,12 @@ float axis(const float v[3], int32_t a) { return a > 0 ? v[a - 1] : -v[-a - 1]; 
 
 void loadParams() {
   prefs.begin("pendulum", true);
+  // Fields are only ever appended, so a shorter blob from an older build is
+  // loaded as a prefix and the new fields keep their defaults.
   Params tmp;
-  if (prefs.getBytesLength("p") == sizeof(Params)) {
-    prefs.getBytes("p", &tmp, sizeof(Params));
+  const size_t len = prefs.getBytesLength("p");
+  if (len >= sizeof(uint32_t) && len <= sizeof(Params)) {
+    prefs.getBytes("p", &tmp, len);
     if (tmp.version == kParamsVersion) P = tmp;
   }
   prefs.end();
@@ -119,6 +125,7 @@ void setupRollers() {
     r->write8(roller::kMode, roller::kModeSpeed);
     r->writeI32(roller::kSpeedMaxCurrent, P.max_current_ma * 100);
     r->writeI32(roller::kSpeed, 0);
+    r->write(roller::kSpeedPid, P.speed_pid, sizeof(P.speed_pid));
   }
 }
 
@@ -265,6 +272,8 @@ void printParams() {
                 P.tc, P.tf);
   Serial.printf("# UMAX %g\n# THLIM %g\n# XLIM %g\n# ARMW %g\n# IMAX %ld\n# DT %g\n", P.u_max, P.th_limit_deg,
                 P.x_limit, P.arm_window_deg, (long)P.max_current_ma, kDt);
+  Serial.printf("# SPID %lu %lu %lu\n", (unsigned long)P.speed_pid[0], (unsigned long)P.speed_pid[1],
+                (unsigned long)P.speed_pid[2]);
 }
 
 void printRollerInfo(roller::Roller& r, const char* name) {
@@ -404,7 +413,7 @@ bool handleCommand(char* line) {
                   roller::Roller(Wire, to).ping() ? "responding" : "NOT responding");
   } else if (!strcmp(cmd, "SPID")) {
     // SPID            : print both rollers' speed PID
-    // SPID p i d      : write raw values to both (not persisted in the roller; FIRE re-sends nothing)
+    // SPID p i d      : write raw values to both; kept in Params (SAVE) and re-sent at boot
     const char* a = strtok(nullptr, " \t");
     if (a) {
       const char* b = strtok(nullptr, " \t");
@@ -417,49 +426,11 @@ bool handleCommand(char* line) {
         pid[i] = strtoul(tok[i], &end, 0);
         if (end == tok[i] || *end) return err("SPID values must be integers (raw register values)");
       }
+      memcpy(P.speed_pid, pid, sizeof(pid));
       for (auto* r : {&left, &right}) r->write(roller::kSpeedPid, pid, sizeof(pid));
     }
     printSpeedPid(left, "left");
     printSpeedPid(right, "right");
-  } else if (!strcmp(cmd, "SPIDTEST")) {
-    // Diagnose why speed-PID writes do not stick: try several write methods on
-    // the left roller and report the read-back after each. Restores the original.
-    const char* a = strtok(nullptr, " \t");
-    const char* b = strtok(nullptr, " \t");
-    const char* c = strtok(nullptr, " \t");
-    if (!idle || !a || !b || !c) return err("SPIDTEST p i d (raw, IDLE only)");
-    const uint32_t want[3] = {strtoul(a, nullptr, 0), strtoul(b, nullptr, 0), strtoul(c, nullptr, 0)};
-    uint32_t orig[3], got[3];
-    left.read(roller::kSpeedPid, orig, sizeof(orig));
-    auto report = [&](const char* how, int st) {
-      delay(20);
-      left.read(roller::kSpeedPid, got, sizeof(got));
-      const bool ok = !memcmp(got, want, sizeof(want));
-      Serial.printf("# %-28s status=%d readback %lu %lu %lu %s\n", how, st, (unsigned long)got[0],
-                    (unsigned long)got[1], (unsigned long)got[2], ok ? "<- CHANGED" : "");
-    };
-    auto block = [&]() { return (int)left.writeStatus(roller::kSpeedPid, want, sizeof(want)); };
-    auto split = [&]() {
-      int st = 0;
-      for (int i = 0; i < 3; ++i) st |= left.writeStatus(roller::kSpeedPid + 4 * i, &want[i], 4);
-      return st;
-    };
-    report("12-byte write, output off", block());
-    report("3x 4-byte write, output off", split());
-    left.writeI32(roller::kSpeed, 0);
-    left.write8(roller::kOutput, 1);
-    delay(50);
-    report("12-byte write, output on", block());
-    report("3x 4-byte write, output on", split());
-    left.write8(roller::kOutput, 0);
-    left.write8(roller::kMode, roller::kModePosition);
-    delay(20);
-    report("12-byte write, position mode", block());
-    left.write8(roller::kMode, roller::kModeSpeed);
-    delay(20);
-    report("after returning to speed mode", 0);
-    left.write(roller::kSpeedPid, orig, sizeof(orig));
-    setupRollers();
   } else if (!strcmp(cmd, "SETUP")) {
     if (idle) setupRollers();
   } else {

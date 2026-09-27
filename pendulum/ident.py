@@ -111,7 +111,7 @@ def fit_step2(t: np.ndarray, u: np.ndarray, p: np.ndarray, max_delay: int = 3) -
         res = least_squares(
             lambda x: simulate_second_order(t, u, *x, d) - p,
             x0=[1.0, 60.0, 0.3, 0.01],
-            bounds=([0.5, 5.0, 0.02, -0.1], [1.5, 500.0, 3.0, 0.2]),
+            bounds=([0.3, 2.0, 0.02, -0.1], [1.5, 500.0, 5.0, 1.0]),
         )
         if best is None or res.cost < best[2]:
             best = (res.x, d, res.cost)
