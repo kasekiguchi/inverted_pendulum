@@ -410,7 +410,13 @@ bool handleCommand(char* line) {
       const char* b = strtok(nullptr, " \t");
       const char* c = strtok(nullptr, " \t");
       if (!idle || !b || !c) return err("SPID p i d (raw, IDLE only)");
-      const uint32_t pid[3] = {strtoul(a, nullptr, 0), strtoul(b, nullptr, 0), strtoul(c, nullptr, 0)};
+      uint32_t pid[3];
+      const char* tok[3] = {a, b, c};
+      for (int i = 0; i < 3; ++i) {
+        char* end;
+        pid[i] = strtoul(tok[i], &end, 0);
+        if (end == tok[i] || *end) return err("SPID values must be integers (raw register values)");
+      }
       for (auto* r : {&left, &right}) r->write(roller::kSpeedPid, pid, sizeof(pid));
     }
     printSpeedPid(left, "left");

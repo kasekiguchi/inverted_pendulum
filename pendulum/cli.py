@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -217,6 +218,53 @@ def cmd_fit_step(a):
     plt.show()
 
 
+def step_overshoot(r: dict) -> float:
+    """Peak / final value of the fitted speed-loop step response."""
+    from scipy.signal import lti, step
+
+    wn, z, tz, k = r["wn"], r["zeta"], r["tz"], r["k"]
+    _, y = step(lti([k * wn**2 * tz, k * wn**2], [1, 2 * z * wn, wn**2]), N=2000)
+    return float(y.max() / y[-1])
+
+
+DEFAULT_SWEEP = [
+    "2500000 30 40000000",  # Roller default (P=25 I=3e-6 D=400)
+    "200000 0 85000000",    # Qiita article (P=2 I=0 D=850)
+    "1250000 0 40000000",
+    "2500000 0 10000000",
+    "2500000 0 85000000",
+    "5000000 0 40000000",
+]
+
+
+def cmd_step_sweep(a):
+    """Run a wheel step test for several speed-PID settings (wheels in the air)."""
+    pids = a.pid or DEFAULT_SWEEP
+    rows = []
+    with Device(a.port) as dev:
+        orig = [l for l in dev.cmd("SPID", echo=False) if "left speed PID raw" in l]
+        orig_raw = orig[0].split("raw ")[1].split(" (")[0] if orig else None
+        print(f"original speed PID: {orig_raw}")
+        for pid in pids:
+            resp = dev.cmd(f"SPID {pid}", echo=False)
+            if any(l.startswith("# ERR") for l in resp):
+                print(f"SPID {pid}: {resp}")
+                continue
+            time.sleep(0.2)
+            out = default_log_name(f"step_pid_{pid.replace(' ', '_')}")
+            dev.record(out, a.duration + 1.5, [f"STEP {a.u} {a.duration}"])
+            log = load_log(out)
+            m = log["state"] == 3
+            r = ident.fit_step2(log["t"][m], log["u"][m], log["psi"][m])
+            r["overshoot"] = step_overshoot(r)
+            rows.append((pid, r, out))
+            print(f"{pid:>24s}: overshoot {r['overshoot']:.2f}x  wn={r['wn']:5.1f}  zeta={r['zeta']:.2f}  "
+                  f"tz={r['tz'] * 1e3:5.1f} ms  delay={r['delay_steps']}  rms={np.rad2deg(r['rms']):.2f} deg  -> {out}")
+        if orig_raw:
+            dev.cmd(f"SPID {orig_raw}", echo=False)
+            print(f"restored speed PID: {orig_raw}")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="pend", description=__doc__)
     ap.add_argument("--params", default="params.toml")
@@ -251,6 +299,13 @@ def main(argv=None):
     s.add_argument("-d", "--duration", type=float, default=20.0)
     s.add_argument("-o", "--out")
     s.set_defaults(func=cmd_run)
+
+    s = sub.add_parser("step-sweep", help="wheel step tests over several speed-PID settings (wheels in the air)")
+    s.add_argument("port")
+    s.add_argument("--pid", action="append", help='raw "P I D" register values; repeatable')
+    s.add_argument("-u", type=float, default=10.0, help="step size [rad/s]")
+    s.add_argument("-d", "--duration", type=float, default=1.0)
+    s.set_defaults(func=cmd_step_sweep)
 
     s = sub.add_parser("plot", help="plot a recorded log")
     s.add_argument("csv")
