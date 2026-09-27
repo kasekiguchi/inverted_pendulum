@@ -52,8 +52,9 @@ struct Params {
   float arm_window_deg = 3.0f;  // start balancing when |th| gets within this
   int32_t max_current_ma = 1200;
   // Roller speed PID (raw register values), sent at boot. Only takes effect when
-  // the roller's own menu has SPEED PID = User-Def. Default: Qiita article values.
-  uint32_t speed_pid[3] = {200000, 0, 85000000};
+  // the roller's own menu has SPEED PID = User-Def. Default: Qiita article values
+  // (P2 D850) plus a small I, which removes the stiction dead band at low speed.
+  uint32_t speed_pid[3] = {200000, 30000, 85000000};
 };
 
 enum class State : uint8_t { kIdle = 0, kArmed = 1, kRun = 2, kStep = 3 };
