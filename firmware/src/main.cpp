@@ -143,7 +143,9 @@ struct Rec {
   uint8_t state;
   uint16_t exec_us;
   float th, psi, dth, dpsi, u, th_acc, vin, v_ref, yaw;
+  uint16_t mark;  // incremented by MARK on the phone and by tuning changes
 };
+constexpr char kLogHeader[] = "t_ms,state,th,psi,dth,dpsi,u,th_acc,exec_us,vin,v_ref,yaw,mark";
 constexpr size_t kRecCap = 6000;  // 60 s at 100 Hz, in PSRAM
 Rec* rec_buf = nullptr;
 size_t rec_cap = 0, rec_head = 0, rec_count = 0;
@@ -159,17 +161,50 @@ void recAlloc() {
   }
 }
 
+// Recording modes: runs only (ARM..stop + 1 s, default) or everything
+// (REC on the phone). A download freezes the buffer so rows do not move.
+bool rec_all = false;
+volatile bool rec_frozen = false;
+uint32_t rec_freeze_ms = 0;
+uint16_t mark = 0;
+uint32_t mark_ms = 0;
+
 void recPush(const Rec& r) {
-  if (!rec_cap) return;
+  if (!rec_cap || rec_frozen) return;
   rec_buf[rec_head] = r;
   rec_head = (rec_head + 1) % rec_cap;
   if (rec_count < rec_cap) ++rec_count;
 }
 
+size_t formatRec(const Rec& r, char* buf, size_t len) {
+  const int n = snprintf(buf, len, "%lu,%u,%.5f,%.5f,%.4f,%.4f,%.4f,%.5f,%u,%.2f,%.3f,%.2f,%u\n",
+                         (unsigned long)r.t_ms, (unsigned)r.state, r.th, r.psi, r.dth, r.dpsi, r.u, r.th_acc,
+                         (unsigned)r.exec_us, r.vin, r.v_ref, r.yaw, (unsigned)r.mark);
+  return n < 0 ? 0 : min<size_t>(n, len - 1);
+}
+
 void printRec(const Rec& r) {
-  Serial.printf("D,%lu,%u,%.5f,%.5f,%.4f,%.4f,%.4f,%.5f,%u,%.2f,%.3f,%.2f\n", (unsigned long)r.t_ms,
-                (unsigned)r.state, r.th, r.psi, r.dth, r.dpsi, r.u, r.th_acc, (unsigned)r.exec_us, r.vin, r.v_ref,
-                r.yaw);
+  char buf[160];
+  formatRec(r, buf, sizeof(buf));
+  Serial.print("D,");
+  Serial.print(buf);
+}
+
+// Recorder access for the phone's /log.csv download (runs in the network task
+// while the buffer is frozen).
+size_t recCount() { return rec_count; }
+size_t recLine(size_t i, char* buf, size_t len) {
+  const size_t start = (rec_head + rec_cap - rec_count) % rec_cap;
+  return formatRec(rec_buf[(start + i) % rec_cap], buf, len);
+}
+void recFreeze(bool on) {
+  rec_frozen = on;
+  rec_freeze_ms = millis();
+}
+
+void newMark(uint32_t now_ms) {
+  ++mark;
+  mark_ms = now_ms;
 }
 
 float step_u = 0, step_dur = 0;
@@ -716,6 +751,91 @@ void pollButtons() {
   }
 }
 
+void sendParams() {
+  char buf[160];
+  snprintf(buf, sizeof(buf), "p,%g,%g,%g,%g,%g,%g,%g,%g,%g,%g", P.K[0], P.K[1], P.K[2], P.K[3], P.trim_deg,
+           P.drive_vmax, P.drive_amax, P.drive_jmax, P.drive_lean_deg, P.drive_yaw);
+  remote::sendText(buf);
+}
+
+// A gain may be scaled but not flipped (the page scales 0..2x the saved value).
+float keepSign(float v, float ref) { return ref * v < 0 ? 0 : v; }
+
+void applyParam(uint8_t id, float v) {
+  switch (id) {
+    case remote::kK0: case remote::kK1: case remote::kK2: case remote::kK3:
+      P.K[id] = keepSign(v, P.K[id]);
+      break;
+    case remote::kTrim: P.trim_deg = constrain(v, -10.0f, 10.0f); break;
+    case remote::kVmax: P.drive_vmax = constrain(v, 0.0f, 1.5f); break;
+    case remote::kAmax: P.drive_amax = constrain(v, 0.1f, 3.0f); break;
+    case remote::kJmax: P.drive_jmax = constrain(v, 0.0f, 20.0f); break;
+    case remote::kLean: P.drive_lean_deg = constrain(v, 0.0f, 30.0f); break;
+    case remote::kYaw: P.drive_yaw = constrain(v, -10.0f, 10.0f); break;
+    default: return;
+  }
+}
+
+// Flash writes block for tens of ms, so a save requested while balancing waits
+// until the robot is stopped.
+bool save_pending = false;
+
+void handleRemote(uint32_t now_ms) {
+  if (save_pending && state == State::kIdle) {
+    save_pending = false;
+    saveParams();
+    sendParams();
+    remote::sendText("m,saved to flash");
+  }
+  remote::Msg m;
+  while (remote::take(m)) {
+    switch (m.action) {
+      case remote::Action::kSet:
+        applyParam(m.param, m.value);
+        if (now_ms - mark_ms > 300) newMark(now_ms);  // one marker per burst of slider moves
+        break;
+      case remote::Action::kSave:
+        if (state == State::kIdle) {
+          saveParams();
+          sendParams();
+          remote::sendText("m,saved to flash");
+        } else {
+          save_pending = true;
+          remote::sendText("m,will save when stopped");
+        }
+        break;
+      case remote::Action::kRevert:
+        loadParams();
+        sendParams();
+        newMark(now_ms);
+        remote::sendText("m,reverted to saved values");
+        break;
+      case remote::Action::kParamsRequest:
+        sendParams();
+        break;
+      case remote::Action::kRecStart:
+        rec_head = rec_count = 0;
+        rec_all = true;
+        remote::sendText("m,recording");
+        break;
+      case remote::Action::kRecStop:
+        rec_all = false;
+        remote::sendText("m,recording runs only");
+        break;
+      case remote::Action::kMark:
+        newMark(now_ms);
+        {
+          char buf[24];
+          snprintf(buf, sizeof(buf), "m,mark %u", (unsigned)mark);
+          remote::sendText(buf);
+        }
+        break;
+      case remote::Action::kNone:
+        break;
+    }
+  }
+}
+
 void drawLcd() {
   auto& d = M5.Display;
   d.setCursor(0, 0);
@@ -756,6 +876,7 @@ void setup() {
   {
     snprintf(ssid, sizeof(ssid), "pendulum-%04X", static_cast<unsigned>(ESP.getEfuseMac() >> 32) & 0xFFFF);
     remote::begin(ssid, kWifiPassword);
+    remote::setLogSource({recCount, recLine, recFreeze, kLogHeader});
     Serial.printf("# wifi AP %s / %s -> http://192.168.4.1\n", ssid, kWifiPassword);
   }
   delay(500);  // let the rollers boot
@@ -804,19 +925,22 @@ void loop() {
   }
 
   const Rec r{now_ms, static_cast<uint8_t>(state), static_cast<uint16_t>(min<uint32_t>(exec_us, 65535)),
-              x[0], x[1], x[2], x[3], u, th_acc, vin, v_ref, yaw};
+              x[0], x[1], x[2], x[3], u, th_acc, vin, v_ref, yaw, mark};
   if (state != State::kIdle) last_active_ms = now_ms;
-  if (state != State::kIdle || now_ms - last_active_ms < 1000) recPush(r);
+  if (rec_frozen && now_ms - rec_freeze_ms > 20000) rec_frozen = false;  // download abandoned
+  if (rec_all || state != State::kIdle || now_ms - last_active_ms < 1000) recPush(r);
   if (logging) printRec(r);
 
   pollSerial();
   pollButtons();
   if (remote::takeStop()) enter(State::kIdle);
   if (remote::takeArm()) requestArm();
+  handleRemote(now_ms);
   static uint32_t pub_ms = 0;
-  if (now_ms - pub_ms > 200) {
+  if (now_ms - pub_ms >= 50) {  // 20 Hz: the tuning page plots tilt and command
     pub_ms = now_ms;
-    remote::publish(stateName(state), th * RAD_TO_DEG, vin_f, v_ref, batWarning());
+    remote::publish({stateName(state), th * RAD_TO_DEG, vin_f, v_ref, u, batWarning(),
+                     rec_count * kDt, rec_all});
   }
   // LCD drawing takes several ms over SPI, so only refresh it while not balancing.
   const bool busy = state == State::kRun || state == State::kStep;
