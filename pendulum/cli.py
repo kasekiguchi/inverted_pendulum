@@ -228,12 +228,15 @@ def step_overshoot(r: dict) -> float:
 
 
 DEFAULT_SWEEP = [
-    "2500000 30 40000000",  # Roller default (P=25 I=3e-6 D=400)
-    "200000 0 85000000",    # Qiita article (P=2 I=0 D=850)
-    "1250000 0 40000000",
-    "2500000 0 10000000",
-    "2500000 0 85000000",
-    "5000000 0 40000000",
+    # Roller presets (menu: SPEED PID). Writes over I2C only take effect with User-Def selected.
+    "1500000 1000 40000000",  # Light Load / User-Def default (P=15 I=1e-4 D=400)
+    "2500000 30 20000000",    # Mid Load (P=25 I=3e-6 D=200)
+    "2500000 30 40000000",    # Heavy Load (P=25 I=3e-6 D=400)
+    "200000 0 85000000",      # Qiita article (P=2 I=0 D=850)
+    "500000 0 40000000",      # P=5 D=400
+    "1500000 0 0",            # P only
+    "500000 0 0",
+    "3000000 0 0",
 ]
 
 
