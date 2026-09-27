@@ -69,6 +69,9 @@ struct Params {
   // (model: ~12.7 deg per m/s^2; 0 disables the feed-forward).
   float drive_jmax = 3.0f;        // m/s^3
   float drive_lean_deg = 12.7f;   // deg per m/s^2
+  // Low-battery cutoff [V] on the rollers' supply; 0 = auto (LiPo detected at
+  // boot when vin > 6 V: cells x 3.5 V; disabled on Grove 5 V power).
+  float vin_min = 0.0f;
 };
 
 enum class State : uint8_t { kIdle = 0, kArmed = 1, kRun = 2, kStep = 3 };
@@ -116,7 +119,19 @@ Deriv dpsi;
 constexpr int kSatAbortSamples = 30;
 int sat_count = 0;
 
-float vin = 0;  // left roller supply voltage, refreshed every 100 ms
+float vin = 0;  // lower of the two rollers' supply voltages, refreshed every 100 ms
+
+// Low-battery protection (see updateBattery).
+enum class Bat : uint8_t { kOk, kLow, kCut };
+constexpr float kBatWarnMargin = 0.3f;  // warn this far above the cutoff
+constexpr int kBatCutUpdates = 10;      // filtered vin below cutoff for 1 s -> cut
+constexpr uint32_t kBatStopDelayMs = 3000;  // hold position this long before motors off
+float vin_f = 0;         // vin low-passed (~1 s), so load sag does not trip
+float vin_cutoff = 0;    // effective cutoff, 0 = disabled
+Bat bat = Bat::kOk;
+bool bat_latched = false;  // set on cut; cleared by VMIN or reboot
+int bat_low_count = 0;
+uint32_t bat_cut_ms = 0;
 float a_ref = 0, v_ref = 0, pos_ref = 0, th_ref = 0, psi_ref = 0, yaw = 0;  // driving reference
 char ssid[24] = "";
 
@@ -213,6 +228,87 @@ void enter(State s) {
   Serial.printf("# state %s\n", stateName(s));
 }
 
+const char* batWarning() {
+  switch (bat) {
+    case Bat::kOk: return "";
+    case Bat::kLow: return "LOW BAT";
+    case Bat::kCut: return "LOW BAT STOP";
+  }
+  return "";
+}
+
+// Banner on the LCD's bottom line; drawn right away even while balancing,
+// since it only changes on battery state transitions.
+void drawBatBanner() {
+  auto& d = M5.Display;
+  const int y = d.height() - 24;
+  if (bat == Bat::kOk) {
+    d.fillRect(0, y, d.width(), 24, TFT_BLACK);
+    return;
+  }
+  d.fillRect(0, y, d.width(), 24, bat == Bat::kCut ? TFT_RED : TFT_ORANGE);
+  d.setTextColor(TFT_WHITE, bat == Bat::kCut ? TFT_RED : TFT_ORANGE);
+  d.setCursor(4, y + 4);
+  d.printf("%s %.2fV", batWarning(), vin_f);
+  d.setTextColor(TFT_WHITE, TFT_BLACK);
+}
+
+void setBat(Bat b) {
+  if (b == bat) return;
+  bat = b;
+  Serial.printf("# battery %s: vin %.2f V (cutoff %.2f V)\n", b == Bat::kOk ? "ok" : batWarning(), vin_f, vin_cutoff);
+  drawBatBanner();
+}
+
+void computeCutoff() {
+  if (P.vin_min > 0) {
+    vin_cutoff = P.vin_min;
+  } else if (vin_f > 6.0f) {
+    const int cells = max(1L, lroundf(vin_f / 3.85f));  // 2S: 6.6-8.4 V, 3S: 9.9-12.6 V
+    vin_cutoff = cells * 3.5f;
+  } else {
+    vin_cutoff = 0;  // Grove 5 V power: no LiPo to protect
+  }
+}
+
+// Called every 100 ms with a fresh vin.
+void updateBattery(uint32_t now_ms) {
+  vin_f += 0.1f * (vin - vin_f);  // ~1 s time constant at 10 Hz
+  if (vin_cutoff <= 0) {
+    setBat(Bat::kOk);
+    return;
+  }
+  bat_low_count = vin_f < vin_cutoff ? bat_low_count + 1 : 0;
+  if (!bat_latched && bat_low_count >= kBatCutUpdates) {
+    bat_latched = true;
+    bat_cut_ms = now_ms;
+    if (state == State::kArmed) enter(State::kIdle);
+  }
+  if (bat_latched) {
+    setBat(Bat::kCut);
+  } else if (vin_f < vin_cutoff + kBatWarnMargin) {
+    setBat(Bat::kLow);
+  } else if (vin_f > vin_cutoff + kBatWarnMargin + 0.1f) {  // hysteresis
+    setBat(Bat::kOk);
+  }
+  // Cut while balancing: the phone command is already ignored (updateReference)
+  // so the robot comes to a stop; turn the motors off after a grace period.
+  if (bat_latched && state != State::kIdle && now_ms - bat_cut_ms > kBatStopDelayMs) {
+    Serial.println("# abort: low battery");
+    enter(State::kIdle);
+  }
+}
+
+bool requestArm() {
+  if (state != State::kIdle) return false;
+  if (bat_latched) {
+    Serial.printf("# ERR low battery (%.2f V < %.2f V): charge, then reboot or send VMIN\n", vin_f, vin_cutoff);
+    return false;
+  }
+  enter(State::kArmed);
+  return true;
+}
+
 bool readImu() {
   if (!imu.readAll(acc, gyro)) {
     ++i2c_errors;
@@ -257,7 +353,7 @@ void startFromHere() {
 // wheel-angle reference follows from travel = r (th + psi). Mirrors
 // pendulum.model.next_accel / simulate().
 void updateReference(uint32_t now_ms) {
-  const remote::Cmd c = remote::get(now_ms);
+  const remote::Cmd c = bat_latched ? remote::Cmd{} : remote::get(now_ms);
   const float dv = c.v * P.drive_vmax - v_ref;
   if (P.drive_jmax > 0) {
     const float a_des = copysignf(fminf(P.drive_amax, sqrtf(2.0f * P.drive_jmax * fabsf(dv))), dv);
@@ -372,6 +468,7 @@ void printParams() {
   Serial.printf("# UMAX %g\n# THLIM %g\n# XLIM %g\n# ARMW %g\n# IMAX %ld\n# DT %g\n", P.u_max, P.th_limit_deg,
                 P.x_limit, P.arm_window_deg, (long)P.max_current_ma, kDt);
   Serial.printf("# DRIVE %g %g %g %g %g\n", P.drive_vmax, P.drive_amax, P.drive_yaw, P.drive_jmax, P.drive_lean_deg);
+  Serial.printf("# VMIN %g (cutoff %.2f V, vin %.2f V)\n", P.vin_min, vin_cutoff, vin_f);
   Serial.printf("# SPID %lu %lu %lu\n", (unsigned long)P.speed_pid[0], (unsigned long)P.speed_pid[1],
                 (unsigned long)P.speed_pid[2]);
 }
@@ -440,12 +537,13 @@ bool handleCommand(char* line) {
     if (isnan(k[3])) return err("K needs 4 values");
     memcpy(P.K, k, sizeof(k));
   } else if (!strcmp(cmd, "ARM")) {
-    if (idle) enter(State::kArmed);
+    requestArm();
   } else if (!strcmp(cmd, "STOP")) {
     enter(State::kIdle);
   } else if (!strcmp(cmd, "STEP")) {
     const float v = next(), d = next();
     if (!idle || isnan(d)) return err("STEP u[rad/s] dur[s] (IDLE only)");
+    if (bat_latched) return err("low battery");
     step_u = constrain(v, -P.u_max, P.u_max);
     step_dur = d;
     step_t0 = millis();
@@ -477,6 +575,12 @@ bool handleCommand(char* line) {
   } else if (!strcmp(cmd, "TC")) { set(P.tc);
   } else if (!strcmp(cmd, "TF")) { set(P.tf);
   } else if (!strcmp(cmd, "UMAX")) { set(P.u_max);
+  } else if (!strcmp(cmd, "VMIN")) {  // VMIN volts (0 = auto); also clears a low-battery latch
+    set(P.vin_min);
+    computeCutoff();
+    bat_latched = false;
+    bat_low_count = 0;
+    Serial.printf("# cutoff %.2f V (vin %.2f V)\n", vin_cutoff, vin_f);
   } else if (!strcmp(cmd, "DRIVE")) {  // DRIVE vmax[m/s] amax[m/s^2] yaw[rad/s] [jmax[m/s^3] lean[deg/(m/s^2)]]
     set(P.drive_vmax);
     set(P.drive_amax);
@@ -576,7 +680,7 @@ void pollSerial() {
 
 void pollButtons() {
   M5.update();
-  if (M5.BtnA.wasPressed() && state == State::kIdle) enter(State::kArmed);
+  if (M5.BtnA.wasPressed()) requestArm();
   if (M5.BtnB.wasPressed()) enter(State::kIdle);
   if (M5.BtnC.wasPressed() && state == State::kIdle) {
     Serial.println("# CAL: hold the robot upright and still for 3 s");
@@ -593,9 +697,11 @@ void drawLcd() {
   d.printf("dth  %+8.1f dps\n", x[2] * RAD_TO_DEG);
   d.printf("psi  %+8.1f deg\n", x[1] * RAD_TO_DEG);
   d.printf("u    %+8.2f rad/s\n", u);
-  d.printf("vin  %6.2f V  rec %4u\n", vin, (unsigned)rec_count);
+  d.printf("vin  %5.2fV min %4.1f\n", vin_f, vin_cutoff);
   d.printf("wifi %s\n", ssid);
-  d.printf("\n A:ARM  B:STOP  C:CAL");
+  d.printf("rec %4u\n", (unsigned)rec_count);
+  d.printf(" A:ARM  B:STOP  C:CAL\n");
+  drawBatBanner();
 }
 
 }  // namespace
@@ -624,6 +730,15 @@ void setup() {
   if (!left.ping() || !right.ping()) Serial.println("# ERR roller not found; check wiring/addresses (INFO)");
   if (!imu.begin()) Serial.println("# ERR IMU not found");
   setupRollers();
+  {
+    int32_t vl = 0, vr = 0;
+    left.readI32(roller::kVin, vl);
+    right.readI32(roller::kVin, vr);
+    vin = vin_f = min(vl, vr) * 0.01f;
+    computeCutoff();
+    Serial.printf("# vin %.2f V, low-battery cutoff %s\n", vin_f,
+                  vin_cutoff > 0 ? String(vin_cutoff, 2).c_str() : "off");
+  }
   calibrate(1.0f, false);  // refresh gyro bias if the robot is still
   measure();
   th = th_acc;
@@ -643,10 +758,17 @@ void loop() {
   const uint32_t exec_us = micros() - t0;
 
   static uint8_t vin_div = 0;
-  if (++vin_div >= 10) {
+  static float vin_side[2] = {vin, vin};  // seeded with the boot reading
+  if (++vin_div >= 5) {  // alternate rollers: each every 100 ms
     vin_div = 0;
+    static uint8_t side = 0;
     int32_t v;
-    if (left.readI32(roller::kVin, v)) vin = v * 0.01f;
+    if ((side ? right : left).readI32(roller::kVin, v)) vin_side[side] = v * 0.01f;
+    side ^= 1;
+    if (!side) {
+      vin = fminf(vin_side[0], vin_side[1]);
+      updateBattery(now_ms);
+    }
   }
 
   const Rec r{now_ms, static_cast<uint8_t>(state), static_cast<uint16_t>(min<uint32_t>(exec_us, 65535)),
@@ -658,11 +780,11 @@ void loop() {
   pollSerial();
   pollButtons();
   if (remote::takeStop()) enter(State::kIdle);
-  if (remote::takeArm() && state == State::kIdle) enter(State::kArmed);
+  if (remote::takeArm()) requestArm();
   static uint32_t pub_ms = 0;
   if (now_ms - pub_ms > 200) {
     pub_ms = now_ms;
-    remote::publish(stateName(state), th * RAD_TO_DEG, vin, v_ref);
+    remote::publish(stateName(state), th * RAD_TO_DEG, vin_f, v_ref, batWarning());
   }
   // LCD drawing takes several ms over SPI, so only refresh it while not balancing.
   const bool busy = state == State::kRun || state == State::kStep;

@@ -21,6 +21,6 @@ bool takeArm();
 bool takeStop();
 
 // Sends a status line to connected pages (call at a few Hz) and cleans up clients.
-void publish(const char* state, float th_deg, float vin, float v_ref);
+void publish(const char* state, float th_deg, float vin, float v_ref, const char* warning);
 
 }  // namespace remote

@@ -29,8 +29,11 @@ body{margin:0;font-family:system-ui,sans-serif;background:#111;color:#eee;touch-
 .row{display:flex;gap:16px;margin:12px}
 button{font-size:20px;padding:14px 28px;border-radius:12px;border:0;color:#fff}
 #arm{background:#2a6}#stop{background:#c33}
+#warn{font-size:22px;font-weight:bold;color:#fff;border-radius:8px;padding:0 12px}
+#warn.low{background:#d80}#warn.cut{background:#c00}
 </style></head><body>
 <div id="st">connecting...</div>
+<div id="warn"></div>
 <div id="pad"><div id="knob"></div></div>
 <div class="row"><button id="arm">ARM</button><button id="stop">STOP</button></div>
 <script>
@@ -40,8 +43,11 @@ function connect(){
   ws=new WebSocket('ws://'+location.host+'/ws');
   ws.onopen=()=>st.textContent='connected';
   ws.onclose=()=>{st.textContent='disconnected - retrying';setTimeout(connect,1000)};
-  ws.onmessage=e=>{const p=e.data.split(',');
-    if(p[0]==='s')st.textContent=p[1]+'  tilt '+p[2]+' deg  v '+p[4]+' m/s  '+p[3]+' V';};
+  ws.onmessage=e=>{const p=e.data.split(',');if(p[0]!=='s')return;
+    st.textContent=p[1]+'  tilt '+p[2]+' deg  v '+p[4]+' m/s  '+p[3]+' V';
+    const w=p[5]||'',el=document.getElementById('warn');
+    if(w!==el.textContent&&w&&navigator.vibrate)navigator.vibrate(300);
+    el.textContent=w;el.className=w.includes('STOP')?'cut':(w?'low':'');};
 }
 connect();
 function send(m){if(ws&&ws.readyState===1)ws.send(m)}
@@ -118,11 +124,11 @@ bool takeStop() {
   return r;
 }
 
-void publish(const char* state, float th_deg, float vin, float v_ref) {
+void publish(const char* state, float th_deg, float vin, float v_ref, const char* warning) {
   ws.cleanupClients();
   if (!ws.count()) return;
-  char msg[64];
-  snprintf(msg, sizeof(msg), "s,%s,%.1f,%.2f,%.2f", state, th_deg, vin, v_ref);
+  char msg[80];
+  snprintf(msg, sizeof(msg), "s,%s,%.1f,%.2f,%.2f,%s", state, th_deg, vin, v_ref, warning);
   ws.textAll(msg);
 }
 
