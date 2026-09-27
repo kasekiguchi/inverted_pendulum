@@ -30,7 +30,7 @@ u_max = 30.0           # rad/s
 
 [lqr]
 q = [100.0, 0.1, 1.0, 0.01]   # weights for [th, psi, dth, dpsi]
-r = 0.01
+r = 0.1    # 0.01 gave a 19 Hz limit cycle after a poke on battery power; 0.1 tolerates 30 ms extra motor lag
 
 [sim]
 th0_deg = 3.0
