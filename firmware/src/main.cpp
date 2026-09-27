@@ -61,10 +61,14 @@ struct Params {
   // Smartphone driving: full-stick forward speed, acceleration limit (the body
   // must lean ~13 deg per m/s^2), and full-stick wheel speed difference for turning.
   float drive_vmax = 0.3f;  // m/s
-  float drive_amax = 0.3f;  // m/s^2
+  float drive_amax = 1.0f;  // m/s^2
   // rad/s added to the 0x64 roller and subtracted from 0x65; the sign depends on
   // which side each roller is mounted (negative on the original robot).
   float drive_yaw = -4.0f;
+  // Reference shaping: jerk limit, and the lean fed forward per unit acceleration
+  // (model: ~12.7 deg per m/s^2; 0 disables the feed-forward).
+  float drive_jmax = 3.0f;        // m/s^3
+  float drive_lean_deg = 12.7f;   // deg per m/s^2
 };
 
 enum class State : uint8_t { kIdle = 0, kArmed = 1, kRun = 2, kStep = 3 };
@@ -113,7 +117,7 @@ constexpr int kSatAbortSamples = 30;
 int sat_count = 0;
 
 float vin = 0;  // left roller supply voltage, refreshed every 100 ms
-float v_ref = 0, psi_ref = 0, yaw = 0;  // driving reference (see updateReference)
+float a_ref = 0, v_ref = 0, pos_ref = 0, th_ref = 0, psi_ref = 0, yaw = 0;  // driving reference
 char ssid[24] = "";
 
 // On-board recorder: keeps the most recent kRecCap samples taken while not
@@ -244,16 +248,27 @@ void startFromHere() {
   x[1] = 0;
   dpsi.reset(psi_raw);
   x[3] = 0;
-  v_ref = psi_ref = yaw = 0;
+  a_ref = v_ref = pos_ref = th_ref = psi_ref = yaw = 0;
 }
 
-// Moves the reference with the smartphone command: v_ref is rate-limited, the
-// wheel-angle reference is its integral, and the yaw difference is rate-limited too.
+// Moves the reference with the smartphone command. The reference acceleration is
+// limited in size (amax) and rate (jmax) and braked early so the speed lands
+// without overshoot; the tilt reference leans into it (feed-forward), and the
+// wheel-angle reference follows from travel = r (th + psi). Mirrors
+// pendulum.model.next_accel / simulate().
 void updateReference(uint32_t now_ms) {
   const remote::Cmd c = remote::get(now_ms);
-  const float dv = constrain(c.v * P.drive_vmax - v_ref, -P.drive_amax * kDt, P.drive_amax * kDt);
-  v_ref += dv;
-  psi_ref += v_ref / P.wheel_r * kDt;
+  const float dv = c.v * P.drive_vmax - v_ref;
+  if (P.drive_jmax > 0) {
+    const float a_des = copysignf(fminf(P.drive_amax, sqrtf(2.0f * P.drive_jmax * fabsf(dv))), dv);
+    a_ref += constrain(a_des - a_ref, -P.drive_jmax * kDt, P.drive_jmax * kDt);
+  } else {
+    a_ref = constrain(dv / kDt, -P.drive_amax, P.drive_amax);
+  }
+  v_ref += a_ref * kDt;
+  pos_ref += v_ref * kDt;
+  th_ref = P.drive_lean_deg * DEG_TO_RAD * a_ref;
+  psi_ref = pos_ref / P.wheel_r - th_ref;
   constexpr float kYawRate = 20.0f;  // rad/s^2
   yaw += constrain(c.w * P.drive_yaw - yaw, -kYawRate * kDt, kYawRate * kDt);
 }
@@ -274,14 +289,14 @@ void control(uint32_t now_ms) {
     case State::kRun: {
       updateReference(now_ms);
       // travel is measured from the moving reference, so driving does not trip XLIM
-      const float travel = P.wheel_r * (x[0] + x[1] - psi_ref);
+      const float travel = P.wheel_r * (x[0] + x[1]) - pos_ref;
       if (fabsf(th) > P.th_limit_deg * DEG_TO_RAD || fabsf(travel) > P.x_limit || i2c_errors > 5) {
         Serial.printf("# abort th=%.1fdeg travel=%.3fm i2c_err=%u\n", th * RAD_TO_DEG, travel, i2c_errors);
         enter(State::kIdle);
         return;
       }
       const float dpsi_ref = v_ref / P.wheel_r;
-      const float e[4] = {x[0], x[1] - psi_ref, x[2], x[3] - dpsi_ref};
+      const float e[4] = {x[0] - th_ref, x[1] - psi_ref, x[2], x[3] - dpsi_ref};
       float s = dpsi_ref;  // feed-forward: the speed loop needs the reference speed
       for (int i = 0; i < 4; ++i) s -= P.K[i] * e[i];
       u = constrain(s, -P.u_max, P.u_max);
@@ -356,7 +371,7 @@ void printParams() {
                 P.tc, P.tf);
   Serial.printf("# UMAX %g\n# THLIM %g\n# XLIM %g\n# ARMW %g\n# IMAX %ld\n# DT %g\n", P.u_max, P.th_limit_deg,
                 P.x_limit, P.arm_window_deg, (long)P.max_current_ma, kDt);
-  Serial.printf("# DRIVE %g %g %g\n", P.drive_vmax, P.drive_amax, P.drive_yaw);
+  Serial.printf("# DRIVE %g %g %g %g %g\n", P.drive_vmax, P.drive_amax, P.drive_yaw, P.drive_jmax, P.drive_lean_deg);
   Serial.printf("# SPID %lu %lu %lu\n", (unsigned long)P.speed_pid[0], (unsigned long)P.speed_pid[1],
                 (unsigned long)P.speed_pid[2]);
 }
@@ -462,10 +477,12 @@ bool handleCommand(char* line) {
   } else if (!strcmp(cmd, "TC")) { set(P.tc);
   } else if (!strcmp(cmd, "TF")) { set(P.tf);
   } else if (!strcmp(cmd, "UMAX")) { set(P.u_max);
-  } else if (!strcmp(cmd, "DRIVE")) {  // DRIVE vmax[m/s] amax[m/s^2] yaw[rad/s]
+  } else if (!strcmp(cmd, "DRIVE")) {  // DRIVE vmax[m/s] amax[m/s^2] yaw[rad/s] [jmax[m/s^3] lean[deg/(m/s^2)]]
     set(P.drive_vmax);
     set(P.drive_amax);
     set(P.drive_yaw);
+    set(P.drive_jmax);
+    set(P.drive_lean_deg);
   } else if (!strcmp(cmd, "THLIM")) { set(P.th_limit_deg);
   } else if (!strcmp(cmd, "XLIM")) { set(P.x_limit);
   } else if (!strcmp(cmd, "ARMW")) { set(P.arm_window_deg);

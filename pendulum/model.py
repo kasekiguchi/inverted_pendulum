@@ -236,15 +236,29 @@ def dynamics(p: Params, x: np.ndarray, u: float, motor) -> np.ndarray:
     return np.concatenate([[dth, dpsi, ddth], dxm])
 
 
+def next_accel(dv: float, a: float, a_max: float, j_max: float, h: float) -> float:
+    """Reference acceleration toward a speed error dv under |a| <= a_max and |da/dt| <= j_max.
+
+    With j_max > 0 it brakes early so the speed arrives without overshoot:
+    the acceleration aims at sqrt(2 j |dv|) (a bang-bang jerk profile)."""
+    if j_max <= 0:
+        return float(np.clip(dv / h, -a_max, a_max))
+    a_des = np.sign(dv) * min(a_max, np.sqrt(2 * j_max * abs(dv)))
+    return float(a + np.clip(a_des - a, -j_max * h, j_max * h))
+
+
 def simulate(p: Params, K: np.ndarray, th0: float, t_end: float, second: bool | None = None,
-             substeps: int = 10, v_target=None, a_max: float = 0.3) -> dict:
+             substeps: int = 10, v_target=None, a_max: float = 0.3, lean_ff: float = 0.0,
+             j_max: float = 0.0) -> dict:
     """Nonlinear simulation reproducing the firmware loop: tilt measured with a
     constant bias (trim error), quantised wheel encoders, filtered-derivative
     wheel speed, saturation and ZOH. Uses the second-order motor if identified.
 
     v_target(t) [m/s] drives the robot like the remote control in the firmware:
     the reference speed is rate-limited by a_max, the wheel-angle reference is
-    its integral, and u = dpsi_ref - K (x - x_ref)."""
+    its integral, and u = dpsi_ref - K (x - x_ref). With lean_ff [rad per m/s^2]
+    the reference tilt leans into the commanded acceleration; j_max > 0 also
+    limits how fast the reference acceleration changes (smooths the lean)."""
     if second is None:
         second = p.has_motor2
     motor = motor_ss(p, second)
@@ -259,7 +273,7 @@ def simulate(p: Params, K: np.ndarray, th0: float, t_end: float, second: bool | 
     u_queue = [0.0] * delay
     psim_old = 0.0
     dpsih = 0.0
-    v_ref = psi_ref = 0.0
+    v_ref = pos_ref = a_ref = 0.0
     names = ("t", "th", "psi", "dth", "dpsi", "u", "travel", "v_ref")
     log = {k: np.zeros(n) for k in names}
     for k in range(n):
@@ -267,11 +281,13 @@ def simulate(p: Params, K: np.ndarray, th0: float, t_end: float, second: bool | 
         dpsih = (2 * (psim - psim_old) + (2 * p.tf - h) * dpsih) / (2 * p.tf + h)
         psim_old = psim
         if v_target is not None:
-            dv = v_target(k * h) - v_ref
-            v_ref += float(np.clip(dv, -a_max * h, a_max * h))
-            psi_ref += v_ref / p.wheel_radius * h
+            a_ref = next_accel(v_target(k * h) - v_ref, a_ref, a_max, j_max, h)
+            v_ref += a_ref * h
+            pos_ref += v_ref * h
+        th_ref = lean_ff * a_ref
+        psi_ref = pos_ref / p.wheel_radius - th_ref  # travel = r (th + psi)
         dpsi_ref = v_ref / p.wheel_radius
-        xh = np.array([x[0] + bias, psim - psi_ref, x[2], dpsih - dpsi_ref])
+        xh = np.array([x[0] + bias - th_ref, psim - psi_ref, x[2], dpsih - dpsi_ref])
         u_cmd = float(np.clip(dpsi_ref - K @ xh, -p.u_max, p.u_max))
         u_queue.append(u_cmd)
         u = u_queue.pop(0)
