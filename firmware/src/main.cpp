@@ -69,8 +69,7 @@ struct Params {
   // (model: ~12.7 deg per m/s^2; 0 disables the feed-forward).
   float drive_jmax = 3.0f;        // m/s^3
   float drive_lean_deg = 12.7f;   // deg per m/s^2
-  // Low-battery cutoff [V] on the rollers' supply; 0 = auto (LiPo detected at
-  // boot when vin > 6 V: cells x 3.5 V; disabled on Grove 5 V power).
+  // Low-battery cutoff [V] on the rollers' supply; 0 = auto (see detectCutoff).
   float vin_min = 0.0f;
 };
 
@@ -129,8 +128,10 @@ constexpr uint32_t kBatStopDelayMs = 3000;  // hold position this long before mo
 float vin_f = 0;         // vin low-passed (~1 s), so load sag does not trip
 float vin_cutoff = 0;    // effective cutoff, 0 = disabled
 Bat bat = Bat::kOk;
-bool bat_latched = false;  // set on cut; cleared by VMIN or reboot
+bool bat_latched = false;  // set on cut; cleared by a charged battery, VMIN or reboot
 int bat_low_count = 0;
+int vin_stable_count = 0;  // updates with vin close to vin_f (voltage settled)
+int bat_cells = 0;         // detected LiPo cells, 0 = none
 uint32_t bat_cut_ms = 0;
 float a_ref = 0, v_ref = 0, pos_ref = 0, th_ref = 0, psi_ref = 0, yaw = 0;  // driving reference
 char ssid[24] = "";
@@ -260,20 +261,47 @@ void setBat(Bat b) {
   drawBatBanner();
 }
 
+// Cutoff from VMIN, or detected from the settled supply voltage:
+//   < 6 V      Grove 5 V power, nothing to protect
+//   6-8.8 V    2S (full charge is 8.4 V)
+//   8.8-13 V   3S (full charge is 12.6 V)
+//   > 13 V     4S, above the rollers' 16 V rating once charged; treated as 4S
 void computeCutoff() {
   if (P.vin_min > 0) {
+    bat_cells = 0;
     vin_cutoff = P.vin_min;
-  } else if (vin_f > 6.0f) {
-    const int cells = max(1L, lroundf(vin_f / 3.85f));  // 2S: 6.6-8.4 V, 3S: 9.9-12.6 V
-    vin_cutoff = cells * 3.5f;
-  } else {
-    vin_cutoff = 0;  // Grove 5 V power: no LiPo to protect
+    return;
   }
+  bat_cells = vin_f < 6.0f ? 0 : vin_f <= 8.8f ? 2 : vin_f <= 13.0f ? 3 : 4;
+  vin_cutoff = bat_cells * 3.5f;
 }
 
 // Called every 100 ms with a fresh vin.
 void updateBattery(uint32_t now_ms) {
   vin_f += 0.1f * (vin - vin_f);  // ~1 s time constant at 10 Hz
+  vin_stable_count = fabsf(vin - vin_f) < 0.1f ? vin_stable_count + 1 : 0;
+
+  // Auto mode follows battery changes without a reboot: detect a LiPo once the
+  // voltage has settled (1 s), forget it when unplugged.
+  if (P.vin_min <= 0 && vin_stable_count >= 10 && state == State::kIdle) {
+    const int prev = bat_cells;
+    computeCutoff();
+    if (bat_cells != prev) {
+      Serial.printf("# battery: %s (vin %.2f V, cutoff %.2f V)\n",
+                    bat_cells ? (bat_cells == 2 ? "2S LiPo" : bat_cells == 3 ? "3S LiPo" : "4S LiPo (over 16 V!)")
+                              : "none",
+                    vin_f, vin_cutoff);
+      bat_latched = false;
+      bat_low_count = 0;
+    }
+  }
+  // A charged battery clears the stop: >= 3.8 V/cell at rest (an emptied cell
+  // recovers to ~3.7 V at most).
+  if (bat_latched && state == State::kIdle && vin_stable_count >= 10 && vin_f > vin_cutoff * (3.8f / 3.5f)) {
+    bat_latched = false;
+    bat_low_count = 0;
+    Serial.printf("# battery: charged (%.2f V), low-battery stop cleared\n", vin_f);
+  }
   if (vin_cutoff <= 0) {
     setBat(Bat::kOk);
     return;
@@ -302,7 +330,7 @@ void updateBattery(uint32_t now_ms) {
 bool requestArm() {
   if (state != State::kIdle) return false;
   if (bat_latched) {
-    Serial.printf("# ERR low battery (%.2f V < %.2f V): charge, then reboot or send VMIN\n", vin_f, vin_cutoff);
+    Serial.printf("# ERR low battery (%.2f V, cutoff %.2f V): swap or charge the battery\n", vin_f, vin_cutoff);
     return false;
   }
   enter(State::kArmed);
@@ -697,7 +725,11 @@ void drawLcd() {
   d.printf("dth  %+8.1f dps\n", x[2] * RAD_TO_DEG);
   d.printf("psi  %+8.1f deg\n", x[1] * RAD_TO_DEG);
   d.printf("u    %+8.2f rad/s\n", u);
-  d.printf("vin  %5.2fV min %4.1f\n", vin_f, vin_cutoff);
+  if (bat_cells) {
+    d.printf("vin  %5.2fV %dS>%4.1f\n", vin_f, bat_cells, vin_cutoff);
+  } else {
+    d.printf("vin  %5.2fV min %4.1f\n", vin_f, vin_cutoff);
+  }
   d.printf("wifi %s\n", ssid);
   d.printf("rec %4u\n", (unsigned)rec_count);
   d.printf(" A:ARM  B:STOP  C:CAL\n");
