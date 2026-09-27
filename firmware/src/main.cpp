@@ -421,6 +421,45 @@ bool handleCommand(char* line) {
     }
     printSpeedPid(left, "left");
     printSpeedPid(right, "right");
+  } else if (!strcmp(cmd, "SPIDTEST")) {
+    // Diagnose why speed-PID writes do not stick: try several write methods on
+    // the left roller and report the read-back after each. Restores the original.
+    const char* a = strtok(nullptr, " \t");
+    const char* b = strtok(nullptr, " \t");
+    const char* c = strtok(nullptr, " \t");
+    if (!idle || !a || !b || !c) return err("SPIDTEST p i d (raw, IDLE only)");
+    const uint32_t want[3] = {strtoul(a, nullptr, 0), strtoul(b, nullptr, 0), strtoul(c, nullptr, 0)};
+    uint32_t orig[3], got[3];
+    left.read(roller::kSpeedPid, orig, sizeof(orig));
+    auto report = [&](const char* how, int st) {
+      delay(20);
+      left.read(roller::kSpeedPid, got, sizeof(got));
+      const bool ok = !memcmp(got, want, sizeof(want));
+      Serial.printf("# %-28s status=%d readback %lu %lu %lu %s\n", how, st, (unsigned long)got[0],
+                    (unsigned long)got[1], (unsigned long)got[2], ok ? "<- CHANGED" : "");
+    };
+    auto block = [&]() { return (int)left.writeStatus(roller::kSpeedPid, want, sizeof(want)); };
+    auto split = [&]() {
+      int st = 0;
+      for (int i = 0; i < 3; ++i) st |= left.writeStatus(roller::kSpeedPid + 4 * i, &want[i], 4);
+      return st;
+    };
+    report("12-byte write, output off", block());
+    report("3x 4-byte write, output off", split());
+    left.writeI32(roller::kSpeed, 0);
+    left.write8(roller::kOutput, 1);
+    delay(50);
+    report("12-byte write, output on", block());
+    report("3x 4-byte write, output on", split());
+    left.write8(roller::kOutput, 0);
+    left.write8(roller::kMode, roller::kModePosition);
+    delay(20);
+    report("12-byte write, position mode", block());
+    left.write8(roller::kMode, roller::kModeSpeed);
+    delay(20);
+    report("after returning to speed mode", 0);
+    left.write(roller::kSpeedPid, orig, sizeof(orig));
+    setupRollers();
   } else if (!strcmp(cmd, "SETUP")) {
     if (idle) setupRollers();
   } else {
