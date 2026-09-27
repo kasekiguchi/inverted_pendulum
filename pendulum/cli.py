@@ -46,18 +46,23 @@ def cmd_design(a):
     p = Params.load(a.params)
     K, poles = design(p)
     s_poles = np.log(poles.astype(complex)) / p.dt
-    print("K (u = -K x, x = [p, th, v, dth]):")
+    print("K (u = -K x, x = [th, psi, dth, dpsi]):")
     print("  " + "  ".join(f"{k:+.4f}" for k in K))
     print("closed-loop poles (continuous equiv.):")
     for s in s_poles:
         print(f"  {s.real:+8.2f} {s.imag:+8.2f}j   |z|={abs(np.exp(s * p.dt)):.4f}")
     print("firmware command:\n  " + gain_command(K))
 
-    x0 = [0, np.deg2rad(p.th0_deg), 0, 0]
+    print(f"lean needed per 1 m/s^2 of acceleration: {np.rad2deg(p.lean_per_accel()):.1f} deg "
+          f"(l = {p.l * 1e3:.1f} mm)")
+
+    x0 = [np.deg2rad(p.th0_deg), 0, 0, 0]
     log = simulate(p, K, x0, p.t_end)
     sat = np.mean(np.abs(log["u"]) >= p.u_max - 1e-9)
-    print(f"simulation: {'FELL' if log['fell'] else 'ok'}, max|p|={np.max(np.abs(log['p'])):.3f} m, "
-          f"max|u|={np.max(np.abs(log['u'])):.3f} m/s, saturated {sat:.0%} of samples")
+    print(f"simulation (th0={p.th0_deg} deg, tilt bias={p.theta_bias_deg} deg): "
+          f"{'FELL' if log['fell'] else 'ok'}, max|travel|={np.max(np.abs(log['travel'])):.3f} m, "
+          f"final travel={log['travel'][-1]:+.3f} m, max|u|={np.max(np.abs(log['u'])):.1f} rad/s, "
+          f"saturated {sat:.0%} of samples")
 
     if a.send:
         with Device(a.send) as dev:
@@ -77,14 +82,17 @@ def plot_states(log, title):
 
     fig, ax = plt.subplots(4, 1, sharex=True, figsize=(8, 8))
     t = log["t"]
-    ax[0].plot(t, np.rad2deg(log["th"]))
+    ax[0].plot(t, np.rad2deg(log["th"]), label="th")
+    if "th_acc" in log:
+        ax[0].plot(t, np.rad2deg(log["th_acc"]), alpha=0.5, label="th_acc")
+        ax[0].legend()
     ax[0].set_ylabel("th [deg]")
-    ax[1].plot(t, log["p"])
-    ax[1].set_ylabel("p [m]")
-    ax[2].plot(t, log["v"], label="v")
-    ax[2].set_ylabel("v [m/s]")
+    ax[1].plot(t, np.rad2deg(log["psi"]))
+    ax[1].set_ylabel("psi [deg]")
+    ax[2].plot(t, np.rad2deg(log["dth"]))
+    ax[2].set_ylabel("dth [deg/s]")
     ax[3].plot(t, log["u"])
-    ax[3].set_ylabel("u [m/s]")
+    ax[3].set_ylabel("u [rad/s]")
     ax[3].set_xlabel("t [s]")
     for x in ax:
         x.grid(True)
@@ -101,7 +109,7 @@ def cmd_term(a):
 def cmd_send(a):
     with Device(a.port) as dev:
         for c in a.commands:
-            dev.cmd(c)
+            dev.cmd(c, timeout=5.0)
 
 
 def cmd_log(a):
@@ -116,7 +124,7 @@ def cmd_run(a):
     """Arm the controller and record until the duration ends."""
     out = a.out or default_log_name("run")
     with Device(a.port) as dev:
-        print("ARMED: lift the pendulum to upright; balancing starts automatically.")
+        print("ARMED: bring the robot upright; balancing starts automatically.")
         n = dev.record(out, a.duration, ["ARM"])
         dev.cmd("STOP", echo=False)
     print(f"wrote {n} rows to {out}")
@@ -138,15 +146,14 @@ def cmd_fit_swing(a):
     import matplotlib.pyplot as plt
 
     log = load_log(a.csv)
-    t, th = log["t"], ident.wrap(log["th"] + np.pi)  # angle from hanging
+    t, th = log["t"], ident.wrap(log["th"] + np.pi)  # upside down: angle from hanging
     m = (t >= a.t0) & (t <= (a.t1 if a.t1 else np.inf))
     r = ident.fit_swing(t[m], th[m])
-    print(f"pend_wn = {r['wn']:.4f} rad/s ({r['wn'] / 2 / np.pi:.3f} Hz)")
-    print(f"pend_zeta = {r['zeta']:.4f}")
-    print(f"hanging offset = {np.rad2deg(r['offset']):+.3f} deg (should be ~0 after ZERO)")
+    print(f"swing_wn = {r['wn']:.4f} rad/s ({r['wn'] / 2 / np.pi:.3f} Hz), zeta = {r['zeta']:.4f}")
+    print(f"hanging offset = {np.rad2deg(r['offset']):+.3f} deg (the CoG is off the body axis by this angle)")
     print(f"fit rms = {np.rad2deg(r['rms']):.3f} deg")
     if a.update:
-        update_toml(a.params, {"pend_wn": r["wn"], "pend_zeta": r["zeta"]})
+        update_toml(a.params, {"swing_wn": r["wn"]})
     plt.plot(t[m], np.rad2deg(th[m]), ".", ms=2, label="measured")
     plt.plot(t[m], np.rad2deg(r["fit"]), label="fit")
     plt.xlabel("t [s]")
@@ -163,19 +170,20 @@ def cmd_fit_step(a):
     m = log["state"] == 3  # STEP
     if not m.any():
         raise SystemExit("no STEP samples in log")
-    t, u, p = log["t"][m], log["u"][m], log["p"][m]
+    t, u, p = log["t"][m], log["u"][m], log["psi"][m]
     r = ident.fit_step(t, u, p)
-    print(f"cart_tau = {r['tau'] * 1e3:.1f} ms, delay = {r['delay_steps']} samples, fit rms = {r['rms'] * 1e3:.2f} mm")
+    print(f"motor_tau = {r['tau'] * 1e3:.1f} ms, delay = {r['delay_steps']} samples, "
+          f"fit rms = {np.rad2deg(r['rms']):.2f} deg")
     if a.update:
-        update_toml(a.params, {"cart_tau": r["tau"]})
+        update_toml(a.params, {"motor_tau": r["tau"]})
     tt = t - t[0]
     fig, ax = plt.subplots(2, 1, sharex=True)
     ax[0].plot(tt, p - p[0], ".", ms=2, label="measured")
     ax[0].plot(tt, r["fit"], label="fit")
-    ax[0].set_ylabel("p [m]")
+    ax[0].set_ylabel("psi [rad]")
     ax[0].legend()
     ax[1].plot(tt, u)
-    ax[1].set_ylabel("u [m/s]")
+    ax[1].set_ylabel("u [rad/s]")
     ax[1].set_xlabel("t [s]")
     for x in ax:
         x.grid(True)
@@ -205,7 +213,7 @@ def main(argv=None):
     s = sub.add_parser("log", help="record a log (optionally after sending commands)")
     s.add_argument("port")
     s.add_argument("-d", "--duration", type=float, default=10.0)
-    s.add_argument("-c", "--cmd", action="append", default=[], help='e.g. -c "STEP 0.2 1.0"')
+    s.add_argument("-c", "--cmd", action="append", default=[], help='e.g. -c "STEP 10 1.0"')
     s.add_argument("-k", "--kind", default="log", help="tag used in the default file name")
     s.add_argument("-o", "--out")
     s.set_defaults(func=cmd_log)
@@ -220,14 +228,14 @@ def main(argv=None):
     s.add_argument("csv")
     s.set_defaults(func=cmd_plot)
 
-    s = sub.add_parser("fit-swing", help="identify pend_wn / pend_zeta from a hanging swing log")
+    s = sub.add_parser("fit-swing", help="identify swing_wn from an upside-down swing log")
     s.add_argument("csv")
     s.add_argument("--t0", type=float, default=0.0)
     s.add_argument("--t1", type=float)
     s.add_argument("--update", action="store_true", help="write results to params.toml")
     s.set_defaults(func=cmd_fit_swing)
 
-    s = sub.add_parser("fit-step", help="identify cart_tau from a STEP log")
+    s = sub.add_parser("fit-step", help="identify motor_tau from a STEP log (wheels in the air)")
     s.add_argument("csv")
     s.add_argument("--update", action="store_true", help="write results to params.toml")
     s.set_defaults(func=cmd_fit_step)

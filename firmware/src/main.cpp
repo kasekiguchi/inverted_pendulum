@@ -1,47 +1,50 @@
-// Cart inverted pendulum on M5Stack FIRE + 2x Unit Roller485 Lite (I2C).
-//   cart  roller (0x64): speed mode, drives the wheels
-//   pend  roller (0x65): encoder mode, measures the pendulum angle
+// Two-wheeled inverted pendulum on M5Stack FIRE + 2x Unit Roller485 Lite (I2C).
+//   left  roller (0x64) / right roller (0x65): speed mode, one per wheel
+//   body tilt: FIRE internal IMU (MPU6886), complementary filter
 //
-// State x = [p, th, v, dth]  (m, rad, m/s, rad/s)
-//   p  : cart position, + = direction the cart moves for a positive command
-//   th : pendulum angle from upright, + = leaning toward +p
-// Control u = -K x  [m/s], sent to the cart roller as a speed command.
+// State x = [th, psi, dth, dpsi]  (rad, rad, rad/s, rad/s)
+//   th  : body tilt from upright, + = leaning forward
+//   psi : wheel angle relative to the body (mean of both), + = rolls forward
+// Control u = -K x  [rad/s], sent to both rollers as a speed command.
 //
 // Serial protocol (line based, 921600 baud): see README.md.
 #include <M5Unified.h>
 #include <Preferences.h>
 #include <Wire.h>
 
+#include "imu.h"
 #include "roller.h"
 
 namespace {
 
-constexpr uint8_t kCartAddr = 0x64;
-constexpr uint8_t kPendAddr = 0x65;
-constexpr int kSda = 21;  // Port A
+constexpr uint8_t kLeftAddr = 0x64;
+constexpr uint8_t kRightAddr = 0x65;
+constexpr int kSda = 21;  // Port A / internal bus
 constexpr int kScl = 22;
 constexpr uint32_t kI2cFreq = 400000;
 constexpr uint32_t kBaud = 921600;
 constexpr uint32_t kDtUs = 10000;  // control period; keep in sync with params.toml [control].dt
 constexpr float kDt = kDtUs * 1e-6f;
-// Register the pendulum angle is read from. If it does not change in encoder
-// mode, check INFO output and try roller::kDialCounter.
-constexpr uint8_t kPendPosReg = roller::kPosReadback;
 
-constexpr uint32_t kParamsVersion = 1;
+constexpr uint32_t kParamsVersion = 2;
 
 struct Params {
   uint32_t version = kParamsVersion;
   float K[4] = {0, 0, 0, 0};    // u = -K x
   float wheel_r = 0.029f;       // m
-  int32_t sgn_cart = 1;         // motor direction -> +p
-  int32_t sgn_pend = 1;         // encoder direction -> +th
-  float pend_zero_deg = 0.0f;   // raw encoder reading while hanging straight down
-  float trim_deg = 0.0f;        // upright offset
+  int32_t sgn_l = 1;            // roller direction -> forward
+  int32_t sgn_r = -1;
+  // IMU axes as signed 1-based indices (e.g. -2 = minus sensor y)
+  int32_t imu_gyro = 1;         // pitch rate, + when tipping forward
+  int32_t imu_fwd = 2;          // accel axis: th_acc = atan2(fwd, up)
+  int32_t imu_up = 3;
+  float trim_deg = 0.0f;        // th_acc reading when balanced upright
+  float gyro_bias[3] = {0, 0, 0};
+  float tc = 0.5f;              // complementary filter time constant [s]
   float tf = 0.02f;             // derivative filter time constant [s]
-  float u_max = 1.0f;           // |u| limit [m/s]
+  float u_max = 30.0f;          // |u| limit [rad/s]
   float th_limit_deg = 30.0f;   // abort when |th| exceeds this
-  float p_limit = 0.5f;         // abort when |p| exceeds this [m]
+  float x_limit = 1.0f;         // abort when wheel travel exceeds this [m]
   float arm_window_deg = 3.0f;  // start balancing when |th| gets within this
   int32_t max_current_ma = 1200;
 };
@@ -70,28 +73,25 @@ struct Deriv {
 
 Params P;
 Preferences prefs;
-roller::Roller cart(Wire, kCartAddr);
-roller::Roller pend(Wire, kPendAddr);
+roller::Roller left(Wire, kLeftAddr);
+roller::Roller right(Wire, kRightAddr);
+Imu imu(Wire);
 
 State state = State::kIdle;
 bool logging = false;
-bool i2c_ok = true;
 uint32_t i2c_errors = 0;
 
-float p_raw = 0, p0 = 0;       // cart position before / offset [m]
-float th = 0, th_hang_deg = 0;
+float acc[3], gyro[3];          // latest IMU sample (gyro bias removed)
+float th = 0, th_acc = 0;       // filtered / accelerometer-only tilt [rad]
+float psi_raw = 0, psi0 = 0;    // wheel angle before / offset [rad]
 float x[4] = {0, 0, 0, 0};
 float u = 0;
-Deriv dp, dth;
+Deriv dpsi;
 
 float step_u = 0, step_dur = 0;
 uint32_t step_t0 = 0;
 
-float wrapDeg(float a) {
-  a = fmodf(a + 180.0f, 360.0f);
-  if (a < 0) a += 360.0f;
-  return a - 180.0f;
-}
+float axis(const float v[3], int32_t a) { return a > 0 ? v[a - 1] : -v[-a - 1]; }
 
 void loadParams() {
   prefs.begin("pendulum", true);
@@ -110,59 +110,69 @@ void saveParams() {
 }
 
 void setupRollers() {
-  cart.write8(roller::kOutput, 0);
-  cart.write8(roller::kMode, roller::kModeSpeed);
-  cart.writeI32(roller::kSpeedMaxCurrent, P.max_current_ma * 100);
-  cart.writeI32(roller::kSpeed, 0);
-  pend.write8(roller::kOutput, 0);
-  pend.write8(roller::kMode, roller::kModeEncoder);
-}
-
-void motorOn() {
-  cart.writeI32(roller::kSpeed, 0);
-  cart.write8(roller::kOutput, 1);
-}
-
-void motorOff() {
-  cart.writeI32(roller::kSpeed, 0);
-  cart.write8(roller::kOutput, 0);
-}
-
-void sendSpeed(float u_mps) {
-  const float rpm = P.sgn_cart * u_mps / P.wheel_r * 60.0f / (2.0f * PI);
-  if (!cart.writeI32(roller::kSpeed, static_cast<int32_t>(lroundf(rpm * 100.0f)))) {
-    ++i2c_errors;
+  for (auto* r : {&left, &right}) {
+    r->write8(roller::kOutput, 0);
+    r->write8(roller::kMode, roller::kModeSpeed);
+    r->writeI32(roller::kSpeedMaxCurrent, P.max_current_ma * 100);
+    r->writeI32(roller::kSpeed, 0);
   }
 }
 
+void setOutput(bool on) {
+  for (auto* r : {&left, &right}) {
+    r->writeI32(roller::kSpeed, 0);
+    r->write8(roller::kOutput, on ? 1 : 0);
+  }
+}
+
+void sendSpeed(float u_rad_s) {
+  const float rpm100 = u_rad_s * 60.0f / (2.0f * PI) * 100.0f;
+  if (!left.writeI32(roller::kSpeed, lroundf(P.sgn_l * rpm100))) ++i2c_errors;
+  if (!right.writeI32(roller::kSpeed, lroundf(P.sgn_r * rpm100))) ++i2c_errors;
+}
+
 void enter(State s) {
-  if (s == State::kIdle) motorOff();
+  if (s == State::kIdle) setOutput(false);
   if (state == State::kIdle && s != State::kIdle) i2c_errors = 0;
   state = s;
   Serial.printf("# state %s\n", stateName(s));
 }
 
-// Read both encoders and update x. Returns false on I2C failure.
-bool measure() {
-  int32_t cp, pp;
-  if (!cart.readI32(roller::kPosReadback, cp) || !pend.readI32(kPendPosReg, pp)) {
+bool readImu() {
+  if (!imu.readAll(acc, gyro)) {
     ++i2c_errors;
     return false;
   }
-  p_raw = P.sgn_cart * (cp * 0.01f) * DEG_TO_RAD * P.wheel_r;
-  th_hang_deg = wrapDeg(P.sgn_pend * (pp * 0.01f - P.pend_zero_deg));
-  th = wrapDeg(th_hang_deg - 180.0f - P.trim_deg) * DEG_TO_RAD;
-  x[0] = p_raw - p0;
-  x[1] = th;
-  x[2] = dp.update(p_raw, P.tf, kDt);
-  x[3] = dth.update(th, P.tf, kDt);
+  for (int i = 0; i < 3; ++i) gyro[i] -= P.gyro_bias[i];
   return true;
 }
 
-void resetFilters() {
-  dp.reset(p_raw);
-  dth.reset(th);
-  x[2] = x[3] = 0;
+float accelTilt() { return atan2f(axis(acc, P.imu_fwd), axis(acc, P.imu_up)); }
+
+// Read IMU and both wheel angles, update x. Returns false on I2C failure.
+bool measure() {
+  int32_t pl, pr;
+  if (!readImu() || !left.readI32(roller::kPosReadback, pl) || !right.readI32(roller::kPosReadback, pr)) {
+    ++i2c_errors;
+    return false;
+  }
+  const float w = axis(gyro, P.imu_gyro);
+  th_acc = accelTilt() - P.trim_deg * DEG_TO_RAD;
+  const float a = P.tc / (P.tc + kDt);
+  th = a * (th + w * kDt) + (1.0f - a) * th_acc;
+  psi_raw = 0.5f * (P.sgn_l * pl + P.sgn_r * pr) * 0.01f * DEG_TO_RAD;
+  x[0] = th;
+  x[1] = psi_raw - psi0;
+  x[2] = w;
+  x[3] = dpsi.update(psi_raw, P.tf, kDt);
+  return true;
+}
+
+void startFromHere() {
+  psi0 = psi_raw;
+  x[1] = 0;
+  dpsi.reset(psi_raw);
+  x[3] = 0;
 }
 
 void control(uint32_t now_ms) {
@@ -172,16 +182,15 @@ void control(uint32_t now_ms) {
       return;
     case State::kArmed:
       if (fabsf(th) < P.arm_window_deg * DEG_TO_RAD) {
-        p0 = p_raw;
-        x[0] = 0;
-        resetFilters();
-        motorOn();
+        startFromHere();
+        setOutput(true);
         enter(State::kRun);
       }
       return;
     case State::kRun: {
-      if (fabsf(th) > P.th_limit_deg * DEG_TO_RAD || fabsf(x[0]) > P.p_limit || i2c_errors > 5) {
-        Serial.printf("# abort th=%.1fdeg p=%.3fm i2c_err=%u\n", th * RAD_TO_DEG, x[0], i2c_errors);
+      const float travel = P.wheel_r * (x[0] + x[1]);
+      if (fabsf(th) > P.th_limit_deg * DEG_TO_RAD || fabsf(travel) > P.x_limit || i2c_errors > 5) {
+        Serial.printf("# abort th=%.1fdeg travel=%.3fm i2c_err=%u\n", th * RAD_TO_DEG, travel, i2c_errors);
         enter(State::kIdle);
         return;
       }
@@ -205,12 +214,53 @@ void control(uint32_t now_ms) {
   }
 }
 
+// Average the IMU for `sec` seconds while the robot is held still.
+// upright=true also sets trim so that the current pose reads th = 0.
+void calibrate(float sec, bool upright) {
+  const float saved[3] = {P.gyro_bias[0], P.gyro_bias[1], P.gyro_bias[2]};
+  for (float& b : P.gyro_bias) b = 0;
+  double g[3] = {0, 0, 0}, g2 = 0, tilt = 0;
+  int n = 0;
+  const uint32_t t_end = millis() + static_cast<uint32_t>(sec * 1000);
+  while (millis() < t_end) {
+    if (readImu()) {
+      for (int i = 0; i < 3; ++i) g[i] += gyro[i];
+      g2 += gyro[0] * gyro[0] + gyro[1] * gyro[1] + gyro[2] * gyro[2];
+      tilt += accelTilt();
+      ++n;
+    }
+    delay(5);
+  }
+  if (n == 0) {
+    memcpy(P.gyro_bias, saved, sizeof(saved));
+    Serial.println("# ERR calibration: no IMU data");
+    return;
+  }
+  double var = g2 / n;
+  for (int i = 0; i < 3; ++i) {
+    g[i] /= n;
+    var -= g[i] * g[i];
+  }
+  const float sd_dps = sqrtf(fmaxf(var, 0)) * RAD_TO_DEG;
+  if (sd_dps > 1.0f) {
+    memcpy(P.gyro_bias, saved, sizeof(saved));
+    Serial.printf("# calibration skipped: moving (gyro sd %.2f dps)\n", sd_dps);
+    return;
+  }
+  for (int i = 0; i < 3; ++i) P.gyro_bias[i] = g[i];
+  if (upright) P.trim_deg = tilt / n * RAD_TO_DEG;
+  th = accelTilt() - P.trim_deg * DEG_TO_RAD;
+  Serial.printf("# gyro bias %.3f %.3f %.3f dps (sd %.2f), trim %.3f deg\n", P.gyro_bias[0] * RAD_TO_DEG,
+                P.gyro_bias[1] * RAD_TO_DEG, P.gyro_bias[2] * RAD_TO_DEG, sd_dps, P.trim_deg);
+}
+
 void printParams() {
   Serial.printf("# K %g %g %g %g\n", P.K[0], P.K[1], P.K[2], P.K[3]);
-  Serial.printf("# R %g\n# SGN %ld %ld\n# PZERO %g\n# TRIM %g\n# TF %g\n", P.wheel_r, (long)P.sgn_cart,
-                (long)P.sgn_pend, P.pend_zero_deg, P.trim_deg, P.tf);
-  Serial.printf("# UMAX %g\n# THLIM %g\n# PLIM %g\n# ARMW %g\n# IMAX %ld\n# DT %g\n", P.u_max,
-                P.th_limit_deg, P.p_limit, P.arm_window_deg, (long)P.max_current_ma, kDt);
+  Serial.printf("# R %g\n# SGN %ld %ld\n# IMU %ld %ld %ld\n# TRIM %g\n# TC %g\n# TF %g\n", P.wheel_r,
+                (long)P.sgn_l, (long)P.sgn_r, (long)P.imu_gyro, (long)P.imu_fwd, (long)P.imu_up, P.trim_deg,
+                P.tc, P.tf);
+  Serial.printf("# UMAX %g\n# THLIM %g\n# XLIM %g\n# ARMW %g\n# IMAX %ld\n# DT %g\n", P.u_max, P.th_limit_deg,
+                P.x_limit, P.arm_window_deg, (long)P.max_current_ma, kDt);
 }
 
 void printRollerInfo(roller::Roller& r, const char* name) {
@@ -219,7 +269,7 @@ void printRollerInfo(roller::Roller& r, const char* name) {
     return;
   }
   uint8_t mode = 0, out = 0, fw = 0, st = 0, err = 0;
-  int32_t vin = 0, pos = 0, dial = 0, spd = 0;
+  int32_t vin = 0, pos = 0, spd = 0;
   r.read8(roller::kMode, mode);
   r.read8(roller::kOutput, out);
   r.read8(roller::kFirmwareVersion, fw);
@@ -227,12 +277,18 @@ void printRollerInfo(roller::Roller& r, const char* name) {
   r.read8(roller::kErrorCode, err);
   r.readI32(roller::kVin, vin);
   r.readI32(roller::kPosReadback, pos);
-  r.readI32(roller::kDialCounter, dial);
   r.readI32(roller::kSpeedReadback, spd);
   static const char* kModes[] = {"?", "speed", "position", "current", "encoder"};
-  Serial.printf("# %s(0x%02X): fw=%u mode=%u(%s) output=%u status=%u err=%u vin=%.2fV pos=%.2fdeg dial=%ld speed=%.2frpm\n",
-                name, r.addr(), fw, mode, mode <= 4 ? kModes[mode] : "?", out, st, err, vin * 0.01f,
-                pos * 0.01f, (long)dial, spd * 0.01f);
+  Serial.printf("# %s(0x%02X): fw=%u mode=%u(%s) output=%u status=%u err=%u vin=%.2fV pos=%.2fdeg speed=%.2frpm\n",
+                name, r.addr(), fw, mode, mode <= 4 ? kModes[mode] : "?", out, st, err, vin * 0.01f, pos * 0.01f,
+                spd * 0.01f);
+}
+
+void printImuInfo() {
+  readImu();
+  Serial.printf("# imu(0x68): whoami=0x%02X acc=%.2f %.2f %.2f m/s2 gyro=%.2f %.2f %.2f dps th_acc=%.2fdeg th=%.2fdeg\n",
+                imu.whoAmI(), acc[0], acc[1], acc[2], gyro[0] * RAD_TO_DEG, gyro[1] * RAD_TO_DEG,
+                gyro[2] * RAD_TO_DEG, th_acc * RAD_TO_DEG, th * RAD_TO_DEG);
 }
 
 // Returns true if the command was recognised.
@@ -248,12 +304,16 @@ bool handleCommand(char* line) {
     const float v = next();
     if (!isnan(v)) dst = v;
   };
+  auto err = [](const char* msg) {
+    Serial.printf("# ERR %s\n", msg);
+    return true;
+  };
   const bool idle = state == State::kIdle;
 
   if (!strcmp(cmd, "K")) {
     float k[4];
     for (auto& ki : k) ki = next();
-    if (isnan(k[3])) return Serial.println("# ERR K needs 4 values"), true;
+    if (isnan(k[3])) return err("K needs 4 values");
     memcpy(P.K, k, sizeof(k));
   } else if (!strcmp(cmd, "ARM")) {
     if (idle) enter(State::kArmed);
@@ -261,51 +321,64 @@ bool handleCommand(char* line) {
     enter(State::kIdle);
   } else if (!strcmp(cmd, "STEP")) {
     const float v = next(), d = next();
-    if (!idle || isnan(d)) return Serial.println("# ERR STEP u[m/s] dur[s] (IDLE only)"), true;
+    if (!idle || isnan(d)) return err("STEP u[rad/s] dur[s] (IDLE only)");
     step_u = constrain(v, -P.u_max, P.u_max);
     step_dur = d;
     step_t0 = millis();
-    p0 = p_raw;
-    resetFilters();
-    motorOn();
+    startFromHere();
+    setOutput(true);
     enter(State::kStep);
   } else if (!strcmp(cmd, "LOG")) {
     logging = next() != 0;
-  } else if (!strcmp(cmd, "ZERO")) {
-    int32_t pp;
-    if (idle && pend.readI32(kPendPosReg, pp)) P.pend_zero_deg = pp * 0.01f;
-  } else if (!strcmp(cmd, "R")) { set(P.wheel_r);
+  } else if (!strcmp(cmd, "CAL")) {
+    if (!idle) return err("CAL is IDLE only");
+    calibrate(3.0f, true);
+  } else if (!strcmp(cmd, "GBIAS")) {
+    if (!idle) return err("GBIAS is IDLE only");
+    calibrate(2.0f, false);
   } else if (!strcmp(cmd, "SGN")) {
-    const float c = next(), p = next();
-    if (!isnan(p) && idle) { P.sgn_cart = c < 0 ? -1 : 1; P.sgn_pend = p < 0 ? -1 : 1; }
+    const float l = next(), r = next();
+    if (isnan(r) || !idle) return err("SGN left right (IDLE only)");
+    P.sgn_l = l < 0 ? -1 : 1;
+    P.sgn_r = r < 0 ? -1 : 1;
+  } else if (!strcmp(cmd, "IMU")) {
+    const float g = next(), f = next(), up = next();
+    auto ok = [](float a) { return !isnan(a) && fabsf(a) >= 1 && fabsf(a) <= 3; };
+    if (!ok(g) || !ok(f) || !ok(up)) return err("IMU gyro fwd up (signed axis 1..3)");
+    P.imu_gyro = g;
+    P.imu_fwd = f;
+    P.imu_up = up;
+  } else if (!strcmp(cmd, "R")) { set(P.wheel_r);
   } else if (!strcmp(cmd, "TRIM")) { set(P.trim_deg);
+  } else if (!strcmp(cmd, "TC")) { set(P.tc);
   } else if (!strcmp(cmd, "TF")) { set(P.tf);
   } else if (!strcmp(cmd, "UMAX")) { set(P.u_max);
   } else if (!strcmp(cmd, "THLIM")) { set(P.th_limit_deg);
-  } else if (!strcmp(cmd, "PLIM")) { set(P.p_limit);
+  } else if (!strcmp(cmd, "XLIM")) { set(P.x_limit);
   } else if (!strcmp(cmd, "ARMW")) { set(P.arm_window_deg);
   } else if (!strcmp(cmd, "IMAX")) {
     const float v = next();
     if (!isnan(v)) {
       P.max_current_ma = static_cast<int32_t>(v);
-      cart.writeI32(roller::kSpeedMaxCurrent, P.max_current_ma * 100);
+      for (auto* r : {&left, &right}) r->writeI32(roller::kSpeedMaxCurrent, P.max_current_ma * 100);
     }
   } else if (!strcmp(cmd, "GET")) {
     printParams();
   } else if (!strcmp(cmd, "SAVE")) {
     saveParams();
   } else if (!strcmp(cmd, "INFO")) {
-    if (!idle) return Serial.println("# ERR INFO is IDLE only"), true;
-    printRollerInfo(cart, "cart");
-    printRollerInfo(pend, "pend");
+    if (!idle) return err("INFO is IDLE only");
+    printRollerInfo(left, "left");
+    printRollerInfo(right, "right");
+    printImuInfo();
   } else if (!strcmp(cmd, "SETADDR")) {
     // Connect only the roller to be changed. SETADDR <old> <new>, decimal or 0x..
     const char* a = strtok(nullptr, " \t");
     const char* b = strtok(nullptr, " \t");
-    if (!idle || !a || !b) return Serial.println("# ERR SETADDR old new (IDLE only)"), true;
+    if (!idle || !a || !b) return err("SETADDR old new (IDLE only)");
     const uint8_t from = strtol(a, nullptr, 0), to = strtol(b, nullptr, 0);
     roller::Roller r(Wire, from);
-    if (!r.ping()) return Serial.printf("# ERR no device at 0x%02X\n", from), true;
+    if (!r.ping()) return err("no device at old address");
     r.write8(roller::kI2cAddress, to);
     delay(100);
     roller::Roller(Wire, to).write8(roller::kSaveFlash, 1);
@@ -346,9 +419,8 @@ void pollButtons() {
   if (M5.BtnA.wasPressed() && state == State::kIdle) enter(State::kArmed);
   if (M5.BtnB.wasPressed()) enter(State::kIdle);
   if (M5.BtnC.wasPressed() && state == State::kIdle) {
-    int32_t pp;
-    if (pend.readI32(kPendPosReg, pp)) P.pend_zero_deg = pp * 0.01f;
-    Serial.println("# pendulum zero set (hanging)");
+    Serial.println("# CAL: hold the robot upright and still for 3 s");
+    calibrate(3.0f, true);
   }
 }
 
@@ -356,20 +428,23 @@ void drawLcd() {
   auto& d = M5.Display;
   d.setCursor(0, 0);
   d.printf("%-6s  i2c_err %-4u\n", stateName(state), i2c_errors);
-  d.printf("th  %+8.2f deg\n", th * RAD_TO_DEG);
-  d.printf("hang%+8.2f deg\n", th_hang_deg);
-  d.printf("p   %+8.3f m\n", x[0]);
-  d.printf("u   %+8.3f m/s\n", u);
-  d.printf("\n A:ARM  B:STOP  C:ZERO");
+  d.printf("th   %+8.2f deg\n", th * RAD_TO_DEG);
+  d.printf("thacc%+8.2f deg\n", th_acc * RAD_TO_DEG);
+  d.printf("dth  %+8.1f dps\n", x[2] * RAD_TO_DEG);
+  d.printf("psi  %+8.1f deg\n", x[1] * RAD_TO_DEG);
+  d.printf("u    %+8.2f rad/s\n", u);
+  d.printf("\n A:ARM  B:STOP  C:CAL");
 }
 
 }  // namespace
 
 void setup() {
   auto cfg = M5.config();
+  cfg.internal_imu = false;  // the IMU is read directly over Wire below
   M5.begin(cfg);
   Serial.setTxBufferSize(4096);
   Serial.begin(kBaud);
+  M5.In_I2C.release();
   Wire.begin(kSda, kScl, kI2cFreq);
 
   M5.Display.setTextSize(2);
@@ -378,13 +453,13 @@ void setup() {
 
   loadParams();
   delay(500);  // let the rollers boot
-  i2c_ok = cart.ping() && pend.ping();
-  if (!i2c_ok) {
-    Serial.println("# ERR roller not found; check wiring/addresses (INFO)");
-  }
+  if (!left.ping() || !right.ping()) Serial.println("# ERR roller not found; check wiring/addresses (INFO)");
+  if (!imu.begin()) Serial.println("# ERR IMU not found");
   setupRollers();
+  calibrate(1.0f, false);  // refresh gyro bias if the robot is still
   measure();
-  resetFilters();
+  th = th_acc;
+  startFromHere();
   Serial.println("# ready");
   printParams();
 }
@@ -400,8 +475,8 @@ void loop() {
   const uint32_t exec_us = micros() - t0;
 
   if (logging) {
-    Serial.printf("D,%lu,%u,%.5f,%.5f,%.4f,%.4f,%.4f,%lu\n", (unsigned long)now_ms, (unsigned)state, x[0],
-                  x[1], x[2], x[3], u, (unsigned long)exec_us);
+    Serial.printf("D,%lu,%u,%.5f,%.5f,%.4f,%.4f,%.4f,%.5f,%lu\n", (unsigned long)now_ms, (unsigned)state, x[0],
+                  x[1], x[2], x[3], u, th_acc, (unsigned long)exec_us);
   }
 
   pollSerial();

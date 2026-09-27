@@ -9,7 +9,7 @@ from pathlib import Path
 
 import serial
 
-LOG_FIELDS = ["t_ms", "state", "p", "th", "v", "dth", "u", "exec_us"]
+LOG_FIELDS = ["t_ms", "state", "th", "psi", "dth", "dpsi", "u", "th_acc", "exec_us"]
 BAUD = 921600
 
 

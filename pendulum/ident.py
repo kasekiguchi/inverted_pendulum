@@ -43,7 +43,7 @@ def fit_swing(t: np.ndarray, th_hang: np.ndarray) -> dict:
 
 
 def simulate_first_order(t, u, tau, delay_steps=0):
-    """Cart position for v' = (u(t - d) - v) / tau, v(0) = p(0) = 0, ZOH input."""
+    """Position for v' = (u(t - d) - v) / tau, v(0) = p(0) = 0, ZOH input."""
     dt = np.diff(t, prepend=t[0])
     ud = np.concatenate([np.zeros(delay_steps), u[: len(u) - delay_steps]])
     v = p = 0.0
@@ -58,7 +58,7 @@ def simulate_first_order(t, u, tau, delay_steps=0):
 
 
 def fit_step(t: np.ndarray, u: np.ndarray, p: np.ndarray, max_delay: int = 5) -> dict:
-    """Fit the speed-loop time constant tau (and an integer sample delay) to cart position."""
+    """Fit the speed-loop time constant tau (and an integer sample delay) to the measured angle."""
     t = t - t[0]
     p = p - p[0]
     best = None
