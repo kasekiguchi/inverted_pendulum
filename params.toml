@@ -1,0 +1,28 @@
+# Plant / controller parameters. SI units unless noted.
+# State x = [p, th, v, dth]: cart position, pendulum angle from upright,
+# cart velocity, pendulum angular velocity. Control u = -K x [m/s].
+
+[plant]
+g = 9.81
+wheel_radius = 0.029   # m  (Tamiya 58 mm tire)
+# Pendulum dynamics, identified with `pend fit-swing` (hanging free oscillation):
+#   th'' = wn^2 th - 2 zeta wn th' - (wn^2 / g) p''
+pend_wn = 6.0          # rad/s  natural frequency while hanging
+pend_zeta = 0.02       # damping ratio
+# Roller485 speed loop modelled as first order: v' = (u - v) / cart_tau.
+# Identified with `pend fit-step`.
+cart_tau = 0.03        # s
+
+[control]
+dt = 0.01              # s, must match kDtUs in firmware/src/main.cpp
+tf = 0.02              # s, derivative filter time constant (firmware TF)
+u_max = 1.0            # m/s
+
+[lqr]
+q = [50.0, 200.0, 1.0, 1.0]   # weights for [p, th, v, dth]
+r = 1.0
+
+[sim]
+th0_deg = 5.0
+t_end = 5.0
+enc_res_deg = 0.022    # effective encoder resolution (14 bit)
