@@ -6,7 +6,7 @@
 g = 9.81
 wheel_radius = 0.029   # m  (Tamiya 58 mm tire)
 m_body = 0.35          # kg, everything except the wheels (FIRE, rollers, frame)
-l = 0.02               # m, CoG height above the axle
+l = 0.03               # m, CoG height above the axle
 J_body = 3e-4          # kg m^2, pitch inertia about the CoG (rough estimate)
 # Upside-down swing test (`pend fit-swing`): wn^2 = m g l / J_axle.
 # If > 0 it overrides J_body.
