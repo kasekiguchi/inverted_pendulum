@@ -62,7 +62,9 @@ struct Params {
   // must lean ~13 deg per m/s^2), and full-stick wheel speed difference for turning.
   float drive_vmax = 0.3f;  // m/s
   float drive_amax = 0.3f;  // m/s^2
-  float drive_yaw = 4.0f;   // rad/s added to one wheel and subtracted from the other
+  // rad/s added to the 0x64 roller and subtracted from 0x65; the sign depends on
+  // which side each roller is mounted (negative on the original robot).
+  float drive_yaw = -4.0f;
 };
 
 enum class State : uint8_t { kIdle = 0, kArmed = 1, kRun = 2, kStep = 3 };
