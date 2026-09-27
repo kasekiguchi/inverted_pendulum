@@ -15,12 +15,15 @@ struct Cmd {
 // Parameters the tuning page can change; the order matches the page.
 enum Param : uint8_t { kK0, kK1, kK2, kK3, kTrim, kVmax, kAmax, kJmax, kLean, kYaw, kParamCount };
 
-enum class Action : uint8_t { kNone, kSet, kSave, kRevert, kParamsRequest, kRecStart, kRecStop, kMark };
+enum class Action : uint8_t {
+  kNone, kSet, kSaveAs, kLoadSet, kDeleteSet, kRevert, kParamsRequest, kRecStart, kRecStop, kMark
+};
 
 struct Msg {
   Action action = Action::kNone;
   uint8_t param = 0;  // for kSet
   float value = 0;    // for kSet
+  char name[16] = ""; // parameter set name for kSaveAs / kLoadSet / kDeleteSet
 };
 
 // Starts the access point and the web server (http://192.168.4.1).

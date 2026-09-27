@@ -131,7 +131,7 @@ Bat bat = Bat::kOk;
 bool bat_latched = false;  // set on cut; cleared by a charged battery, VMIN or reboot
 int bat_low_count = 0;
 int vin_stable_count = 0;  // updates with vin close to vin_f (voltage settled)
-int bat_cells = 0;         // detected LiPo cells, 0 = none
+int pack_cells = -1;       // detected supply: -1 not yet, 0 Grove 5 V, 2..4 LiPo cells
 uint32_t bat_cut_ms = 0;
 float a_ref = 0, v_ref = 0, pos_ref = 0, th_ref = 0, psi_ref = 0, yaw = 0;  // driving reference
 char ssid[24] = "";
@@ -231,6 +231,135 @@ void saveParams() {
   prefs.end();
 }
 
+// ---- Named parameter sets ------------------------------------------------
+// A set is a whole Params blob (gains, trim, IMU axes, wheel signs, speed PID,
+// driving and battery settings) stored in NVS namespace "psets" under its
+// name; "_index" lists the names. "Default_5V" / "Default_2S" / "Default_3S" /
+// "Default_4S" are loaded automatically when that supply is detected.
+constexpr char kSetsNs[] = "psets";
+constexpr size_t kSetNameMax = 15;  // NVS key limit
+constexpr int kMaxSets = 16;
+char active_set[kSetNameMax + 1] = "";
+
+void sendParams();
+void sendSets();
+void sendAll();
+void setupRollers();
+void computeCutoff();
+
+bool validSetName(const char* n) {
+  const size_t len = strlen(n);
+  if (len == 0 || len > kSetNameMax || n[0] == '_') return false;
+  for (const char* c = n; *c; ++c) {
+    if (!isalnum(static_cast<unsigned char>(*c)) && *c != '_' && *c != '-') return false;
+  }
+  return true;
+}
+
+String setIndex() {
+  prefs.begin(kSetsNs, true);
+  String idx = prefs.getString("_index", "");
+  prefs.end();
+  return idx;
+}
+
+bool indexHas(const String& idx, const char* name) {
+  return (String(",") + idx + ",").indexOf(String(",") + name + ",") >= 0;
+}
+
+void saveActiveName() {
+  prefs.begin("pendulum", false);
+  prefs.putString("active", active_set);
+  prefs.end();
+}
+
+bool setSave(const char* name) {
+  if (!validSetName(name)) return false;
+  String idx = setIndex();
+  if (!indexHas(idx, name)) {
+    int n = idx.length() ? 1 : 0;
+    for (char c : idx) n += c == ',';
+    if (n >= kMaxSets) return false;
+    idx = idx.length() ? idx + "," + name : String(name);
+  }
+  prefs.begin(kSetsNs, false);
+  const bool ok = prefs.putBytes(name, &P, sizeof(Params)) == sizeof(Params);
+  prefs.putString("_index", idx);
+  prefs.end();
+  if (!ok) return false;
+  strncpy(active_set, name, kSetNameMax);
+  saveActiveName();
+  saveParams();  // also the boot-time working copy
+  return true;
+}
+
+// Loads a set into P. The gyro bias measured at boot is kept (it belongs to
+// this power-up, not to the set). Call only while IDLE.
+bool setLoad(const char* name) {
+  if (!validSetName(name)) return false;
+  prefs.begin(kSetsNs, true);
+  const size_t len = prefs.getBytesLength(name);
+  Params tmp;
+  const bool ok = len >= sizeof(uint32_t) && len <= sizeof(Params) && prefs.getBytes(name, &tmp, len) == len &&
+                  tmp.version == kParamsVersion;
+  prefs.end();
+  if (!ok) return false;
+  memcpy(tmp.gyro_bias, P.gyro_bias, sizeof(P.gyro_bias));
+  P = tmp;
+  strncpy(active_set, name, kSetNameMax);
+  saveActiveName();
+  setupRollers();
+  computeCutoff();
+  return true;
+}
+
+bool setDelete(const char* name) {
+  String idx = setIndex();
+  if (!indexHas(idx, name)) return false;
+  String out;
+  int from = 0;
+  while (from <= static_cast<int>(idx.length())) {
+    int to = idx.indexOf(',', from);
+    if (to < 0) to = idx.length();
+    const String tok = idx.substring(from, to);
+    if (tok.length() && tok != name) out += (out.length() ? "," : "") + tok;
+    from = to + 1;
+  }
+  prefs.begin(kSetsNs, false);
+  prefs.remove(name);
+  prefs.putString("_index", out);
+  prefs.end();
+  if (!strcmp(active_set, name)) {
+    active_set[0] = 0;
+    saveActiveName();
+  }
+  return true;
+}
+
+const char* packDefaultName(int cells) {
+  static char buf[16];
+  if (cells == 0) return "Default_5V";
+  snprintf(buf, sizeof(buf), "Default_%dS", cells);
+  return buf;
+}
+
+// Supply type changed (or first detected after boot): load its default set if saved.
+void loadPackDefault() {
+  const char* name = packDefaultName(pack_cells);
+  if (!indexHas(setIndex(), name)) {
+    Serial.printf("# no set %s; keeping %s\n", name, active_set[0] ? active_set : "current parameters");
+    return;
+  }
+  if (setLoad(name)) {
+    Serial.printf("# loaded set %s\n", name);
+    char msg[40];
+    snprintf(msg, sizeof(msg), "m,loaded %s", name);
+    remote::sendText(msg);
+    sendParams();
+    sendSets();
+  }
+}
+
 void setupRollers() {
   for (auto* r : {&left, &right}) {
     r->write8(roller::kOutput, 0);
@@ -301,14 +430,11 @@ void setBat(Bat b) {
 //   6-8.8 V    2S (full charge is 8.4 V)
 //   8.8-13 V   3S (full charge is 12.6 V)
 //   > 13 V     4S, above the rollers' 16 V rating once charged; treated as 4S
+int detectPack(float v) { return v < 6.0f ? 0 : v <= 8.8f ? 2 : v <= 13.0f ? 3 : 4; }
+
 void computeCutoff() {
-  if (P.vin_min > 0) {
-    bat_cells = 0;
-    vin_cutoff = P.vin_min;
-    return;
-  }
-  bat_cells = vin_f < 6.0f ? 0 : vin_f <= 8.8f ? 2 : vin_f <= 13.0f ? 3 : 4;
-  vin_cutoff = bat_cells * 3.5f;
+  const int cells = pack_cells >= 0 ? pack_cells : detectPack(vin_f);
+  vin_cutoff = P.vin_min > 0 ? P.vin_min : cells * 3.5f;
 }
 
 // Called every 100 ms with a fresh vin.
@@ -316,18 +442,20 @@ void updateBattery(uint32_t now_ms) {
   vin_f += 0.1f * (vin - vin_f);  // ~1 s time constant at 10 Hz
   vin_stable_count = fabsf(vin - vin_f) < 0.1f ? vin_stable_count + 1 : 0;
 
-  // Auto mode follows battery changes without a reboot: detect a LiPo once the
-  // voltage has settled (1 s), forget it when unplugged.
-  if (P.vin_min <= 0 && vin_stable_count >= 10 && state == State::kIdle) {
-    const int prev = bat_cells;
-    computeCutoff();
-    if (bat_cells != prev) {
-      Serial.printf("# battery: %s (vin %.2f V, cutoff %.2f V)\n",
-                    bat_cells ? (bat_cells == 2 ? "2S LiPo" : bat_cells == 3 ? "3S LiPo" : "4S LiPo (over 16 V!)")
-                              : "none",
+  // Follow supply changes without a reboot: once the voltage has settled (1 s)
+  // while stopped, classify it; on a change (and the first time after boot)
+  // load that supply's default set and recompute the cutoff.
+  if (vin_stable_count >= 10 && state == State::kIdle) {
+    const int cells = detectPack(vin_f);
+    if (cells != pack_cells) {
+      pack_cells = cells;
+      computeCutoff();
+      Serial.printf("# supply: %s (vin %.2f V, cutoff %.2f V)\n",
+                    cells ? (cells == 2 ? "2S LiPo" : cells == 3 ? "3S LiPo" : "4S LiPo (over 16 V!)") : "Grove 5 V",
                     vin_f, vin_cutoff);
       bat_latched = false;
       bat_low_count = 0;
+      loadPackDefault();
     }
   }
   // A charged battery clears the stop: >= 3.8 V/cell at rest (an emptied cell
@@ -532,6 +660,7 @@ void printParams() {
                 P.x_limit, P.arm_window_deg, (long)P.max_current_ma, kDt);
   Serial.printf("# DRIVE %g %g %g %g %g\n", P.drive_vmax, P.drive_amax, P.drive_yaw, P.drive_jmax, P.drive_lean_deg);
   Serial.printf("# VMIN %g (cutoff %.2f V, vin %.2f V)\n", P.vin_min, vin_cutoff, vin_f);
+  Serial.printf("# SET %s\n", active_set[0] ? active_set : "-");
   Serial.printf("# SPID %lu %lu %lu\n", (unsigned long)P.speed_pid[0], (unsigned long)P.speed_pid[1],
                 (unsigned long)P.speed_pid[2]);
 }
@@ -667,6 +796,15 @@ bool handleCommand(char* line) {
     Serial.println("# dump end");
   } else if (!strcmp(cmd, "CLEARLOG")) {
     rec_head = rec_count = 0;
+  } else if (!strcmp(cmd, "SETS")) {
+    Serial.printf("# active %s\n# sets %s\n", active_set[0] ? active_set : "-", setIndex().c_str());
+  } else if (!strcmp(cmd, "SAVEAS") || !strcmp(cmd, "LOADSET") || !strcmp(cmd, "DELSET")) {
+    const char* name = strtok(nullptr, " \t");
+    if (!name || !validSetName(name)) return err("name: 1-15 of A-Z a-z 0-9 _ - (not starting with _)");
+    if (!idle) return err("IDLE only");
+    const bool ok = !strcmp(cmd, "SAVEAS") ? setSave(name) : !strcmp(cmd, "LOADSET") ? setLoad(name) : setDelete(name);
+    if (!ok) return err("failed (unknown set, or 16 sets already)");
+    sendAll();
   } else if (!strcmp(cmd, "GET")) {
     printParams();
   } else if (!strcmp(cmd, "SAVE")) {
@@ -758,6 +896,27 @@ void sendParams() {
   remote::sendText(buf);
 }
 
+// "n,<active>,<set>,<set>,..." for the set selector.
+void sendSets() {
+  String msg = String("n,") + active_set;
+  const String idx = setIndex();
+  if (idx.length()) msg += "," + idx;
+  remote::sendText(msg.c_str());
+}
+
+// Fixed quantities shown in the equations on the tuning page.
+void sendConsts() {
+  char buf[96];
+  snprintf(buf, sizeof(buf), "c,%g,%g,%g,%g,%g,%g", P.wheel_r, P.tc, P.tf, P.u_max, kDt, vin_cutoff);
+  remote::sendText(buf);
+}
+
+void sendAll() {
+  sendParams();
+  sendSets();
+  sendConsts();
+}
+
 // A gain may be scaled but not flipped (the page scales 0..2x the saved value).
 float keepSign(float v, float ref) { return ref * v < 0 ? 0 : v; }
 
@@ -776,16 +935,30 @@ void applyParam(uint8_t id, float v) {
   }
 }
 
+void reply(const char* fmt, const char* arg) {
+  char buf[64];
+  snprintf(buf, sizeof(buf), fmt, arg);
+  remote::sendText(buf);
+  Serial.printf("# %s\n", buf + 2);
+}
+
 // Flash writes block for tens of ms, so a save requested while balancing waits
 // until the robot is stopped.
-bool save_pending = false;
+char save_pending[kSetNameMax + 1] = "";
+
+void doSave(const char* name) {
+  if (setSave(name)) {
+    sendAll();
+    reply("m,saved as %s", name);
+  } else {
+    reply("m,cannot save '%s' (1-15 of A-Z a-z 0-9 _ -, max 16 sets)", name);
+  }
+}
 
 void handleRemote(uint32_t now_ms) {
-  if (save_pending && state == State::kIdle) {
-    save_pending = false;
-    saveParams();
-    sendParams();
-    remote::sendText("m,saved to flash");
+  if (save_pending[0] && state == State::kIdle) {
+    doSave(save_pending);
+    save_pending[0] = 0;
   }
   remote::Msg m;
   while (remote::take(m)) {
@@ -794,24 +967,55 @@ void handleRemote(uint32_t now_ms) {
         applyParam(m.param, m.value);
         if (now_ms - mark_ms > 300) newMark(now_ms);  // one marker per burst of slider moves
         break;
-      case remote::Action::kSave:
+      case remote::Action::kSaveAs:
         if (state == State::kIdle) {
-          saveParams();
-          sendParams();
-          remote::sendText("m,saved to flash");
+          doSave(m.name);
         } else {
-          save_pending = true;
-          remote::sendText("m,will save when stopped");
+          strncpy(save_pending, m.name, kSetNameMax);
+          reply("m,will save %s when stopped", m.name);
+        }
+        break;
+      case remote::Action::kLoadSet:
+        if (state != State::kIdle) {
+          reply("m,stop before switching to %s", m.name);
+        } else if (setLoad(m.name)) {
+          sendAll();
+          newMark(now_ms);
+          reply("m,loaded %s", m.name);
+        } else {
+          reply("m,cannot load %s", m.name);
+        }
+        break;
+      case remote::Action::kDeleteSet:
+        if (setDelete(m.name)) {
+          sendSets();
+          reply("m,deleted %s", m.name);
+        } else {
+          reply("m,no set %s", m.name);
         }
         break;
       case remote::Action::kRevert:
-        loadParams();
-        sendParams();
-        newMark(now_ms);
-        remote::sendText("m,reverted to saved values");
+        // back to the active set as saved (or the working copy if none)
+        if (state != State::kIdle) {
+          reply("m,stop before %s", "revert");
+        } else if (!(active_set[0] && setLoad(active_set))) {
+          float bias[3];
+          memcpy(bias, P.gyro_bias, sizeof(bias));
+          loadParams();
+          memcpy(P.gyro_bias, bias, sizeof(bias));
+          setupRollers();
+          computeCutoff();
+          sendAll();
+          newMark(now_ms);
+          reply("m,reverted to %s", "saved values");
+        } else {
+          sendAll();
+          newMark(now_ms);
+          reply("m,reverted to %s", active_set);
+        }
         break;
       case remote::Action::kParamsRequest:
-        sendParams();
+        sendAll();
         break;
       case remote::Action::kRecStart:
         rec_head = rec_count = 0;
@@ -845,8 +1049,9 @@ void drawLcd() {
   d.printf("dth  %+8.1f dps\n", x[2] * RAD_TO_DEG);
   d.printf("psi  %+8.1f deg\n", x[1] * RAD_TO_DEG);
   d.printf("u    %+8.2f rad/s\n", u);
-  if (bat_cells) {
-    d.printf("vin  %5.2fV %dS>%4.1f\n", vin_f, bat_cells, vin_cutoff);
+  d.printf("set  %-15s\n", active_set[0] ? active_set : "-");
+  if (pack_cells > 0) {
+    d.printf("vin  %5.2fV %dS>%4.1f\n", vin_f, pack_cells, vin_cutoff);
   } else {
     d.printf("vin  %5.2fV min %4.1f\n", vin_f, vin_cutoff);
   }
@@ -872,6 +1077,9 @@ void setup() {
   M5.Display.fillScreen(TFT_BLACK);
 
   loadParams();
+  prefs.begin("pendulum", true);
+  prefs.getString("active", active_set, sizeof(active_set));
+  prefs.end();
   recAlloc();
   {
     snprintf(ssid, sizeof(ssid), "pendulum-%04X", static_cast<unsigned>(ESP.getEfuseMac() >> 32) & 0xFFFF);

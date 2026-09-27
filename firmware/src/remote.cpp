@@ -51,6 +51,16 @@ canvas{width:96%;height:140px;background:#1a1a1a;border-radius:6px}
 .ed button{width:34px;height:32px;font-size:18px;border:0;border-radius:6px;background:#345;color:#fff}
 .x{color:#999;font-size:12px;min-width:44px;text-align:right}
 #msg{min-height:1.2em;color:#8c8;font-size:14px}
+.txt{font-size:16px;background:#222;color:#eee;border:1px solid #555;border-radius:8px;padding:8px;width:170px}
+#setbar{display:flex;flex-direction:column;align-items:center;margin-bottom:12px}
+#setbar.hide{display:none}
+.chips{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin:6px;max-width:520px}
+.chips button{font-size:15px;padding:8px 12px;border-radius:16px;border:1px solid #555;background:#222;color:#ccc}
+.chips button.on{background:#4a8;color:#fff;border-color:#4a8}
+.eq{font-family:ui-monospace,Menlo,monospace;font-size:12px;white-space:pre-wrap;background:#1a1a1a;padding:10px;
+  border-radius:6px;width:92%;line-height:1.55;margin:8px 0;color:#ddd}
+.eq b{color:#8cf}
+.note{font-size:13px;color:#999;padding:0 16px;max-width:520px}
 </style></head><body>
 <div id="st">connecting...</div>
 <div id="warn"></div>
@@ -60,17 +70,26 @@ canvas{width:96%;height:140px;background:#1a1a1a;border-radius:6px}
   <canvas id="plot" width="480" height="140"></canvas>
   <div style="font-size:12px;color:#999">tilt [deg] (green, &plusmn;10) / command u [rad/s] (orange, &plusmn;30)</div>
   <div id="params" style="width:100%;display:flex;flex-direction:column;align-items:center"></div>
-  <div class="row"><button class="btn" id="save">SAVE</button><button class="btn" id="revert">REVERT</button></div>
+  <div class="row"><input class="txt" id="savename" maxlength="15" placeholder="set name">
+    <button class="btn" id="save">SAVE</button></div>
+  <div class="row"><button class="btn" id="revert">REVERT</button><button class="btn" id="delete">DELETE</button></div>
+  <div class="note">SAVE: この名前でパラメータセットを保存（同名は上書き）。REVERT: 使用中のセットの保存値に戻す。
+  Default_5V / Default_2S / Default_3S という名前のセットは、電源（Grove 5V / LiPo 2S / 3S）を検出したとき自動で読み込まれます。</div>
+  <div class="eq" id="eq"></div>
 </section>
 <section id="log">
   <div id="recinfo" style="margin:10px">-</div>
-  <div class="row"><button class="btn" id="rec">REC</button><button class="btn" id="mark">MARK</button>
+  <div class="row"><button class="btn" id="rec">REC</button><button class="btn" id="mark">MARK</button></div>
+  <div class="row"><input class="txt" id="logname" maxlength="48" placeholder="file name">
   <a class="btn" id="dl" href="/log.csv" download="pendulum_log.csv">Download CSV</a></div>
-  <div style="font-size:13px;color:#999;padding:0 16px">Without REC, runs (ARM to stop) are recorded automatically.
-  REC records continuously from now. The recorder keeps the last 60 s. MARK (and every tuning change) sets a marker.</div>
+  <div class="note">REC なし: 倒立中（ARM〜停止）だけ自動で記録。REC: 押した時点から停止中も含めて連続記録。本体には直近 60 秒を保持。<br>
+  MARK: ログの「その時刻」に印を付ける（CSV の mark 列の番号が 1 増える）。チューニングで値を変えたときも自動で付く。<br>
+  ファイル名は上の欄で指定（.csv は自動で付く）。</div>
 </section>
 <div id="msg"></div>
 <div class="row"><button class="big" id="arm">ARM</button><button class="big" id="stop">STOP</button></div>
+<div id="setbar"><div>parameter set: <b id="setname">-</b></div><div class="chips" id="sets"></div>
+  <div class="note">タップで切り替え（停止中のみ）</div></div>
 <script>
 const $=id=>document.getElementById(id);
 const st=$('st'),pad=$('pad'),knob=$('knob'),msg=$('msg');
@@ -106,7 +125,7 @@ function sync(i,from,quiet){const p=P[i];
   if(from!=='r')$('r'+i).value=p.k==='rel'?clamp(base[i]?cur[i]/base[i]:1,0,2):p.k==='off'?clamp(cur[i]-base[i],p.min,p.max):clamp(cur[i],p.min,p.max);
   if(from!=='n')$('n'+i).value=cur[i].toFixed(digits(i));
   $('x'+i).textContent=p.k==='rel'&&base[i]?'x'+(cur[i]/base[i]).toFixed(2):p.k==='off'?(cur[i]-base[i]>=0?'+':'')+(cur[i]-base[i]).toFixed(2):'';
-  if(!quiet)dirty.add(i)}
+  if(!quiet)dirty.add(i);eqs()}
 setInterval(()=>{dirty.forEach(i=>send('set,'+i+','+cur[i].toPrecision(6)));dirty.clear()},100);
 function setParams(a){a.forEach((v,i)=>{if(i>=P.length)return;base[i]=cur[i]=v;sync(i,undefined,true)});}
 // plot
@@ -119,7 +138,9 @@ function connect(){
   ws.onopen=()=>{st.textContent='connected';send('getp')};
   ws.onclose=()=>{st.textContent='disconnected - retrying';setTimeout(connect,1000)};
   ws.onmessage=e=>{const p=e.data.split(',');
-    if(p[0]==='p'){setParams(p.slice(1).map(parseFloat));return}
+    if(p[0]==='p'){setParams(p.slice(1).map(parseFloat));eqs();return}
+    if(p[0]==='n'){setSets(p[1],p.slice(2).filter(x=>x));return}
+    if(p[0]==='c'){const v=p.slice(1).map(parseFloat);C={r:v[0],tc:v[1],tf:v[2],umax:v[3],dt:v[4],cut:v[5]};eqs();return}
     if(p[0]==='m'){msg.textContent=p.slice(1).join(',');setTimeout(()=>msg.textContent='',3000);return}
     if(p[0]!=='s')return;
     st.textContent=p[1]+'  tilt '+p[2]+' deg  v '+p[4]+' m/s  '+p[3]+' V';
@@ -135,6 +156,7 @@ connect();
 function send(m){if(ws&&ws.readyState===1)ws.send(m)}
 // tabs
 document.querySelectorAll('#tabs button').forEach(b=>b.onclick=()=>{
+  $('setbar').classList.toggle('hide',b.dataset.t!=='drive');
   document.querySelectorAll('#tabs button').forEach(x=>x.classList.toggle('on',x===b));
   document.querySelectorAll('section').forEach(s=>s.classList.toggle('on',s.id===b.dataset.t));});
 // joystick
@@ -151,17 +173,65 @@ window.addEventListener('mouseup',()=>{if(active)end()});
 setInterval(()=>{if(active)send('j,'+jy.toFixed(2)+','+jx.toFixed(2))},50);
 $('arm').onclick=()=>send('arm');
 $('stop').onclick=()=>{end();send('stop')};
-$('save').onclick=()=>send('save');
+const NAME=/^[A-Za-z0-9-][A-Za-z0-9_-]{0,14}$/;
+function note(t){msg.textContent=t;setTimeout(()=>msg.textContent='',3000)}
+$('save').onclick=()=>{const n=$('savename').value.trim();
+  if(!NAME.test(n)){note('name: 1-15 of A-Z a-z 0-9 _ - (not starting with _)');return}send('saveas,'+n)};
 $('revert').onclick=()=>send('revert');
+$('delete').onclick=()=>{const n=$('savename').value.trim();if(n&&confirm('Delete parameter set "'+n+'"?'))send('del,'+n)};
+// parameter sets
+let activeSet='';
+function setSets(act,names){activeSet=act;$('setname').textContent=act||'(unsaved)';
+  if(document.activeElement!==$('savename'))$('savename').value=act;
+  if(!logEdited)$('logname').value=(act||'pendulum')+'_log',dlName();
+  const c=$('sets');c.innerHTML='';
+  names.forEach(n=>{const b=document.createElement('button');b.textContent=n;b.classList.toggle('on',n===act);
+    b.onclick=()=>send('load,'+n);c.appendChild(b)});}
+// log file name
+let logEdited=false;
+function dlName(){const n=$('logname').value.trim()||'pendulum_log';
+  $('dl').href='/log.csv?name='+encodeURIComponent(n);$('dl').setAttribute('download',n.replace(/\.csv$/,'')+'.csv')}
+$('logname').addEventListener('input',()=>{logEdited=true;dlName()});
+// equations with the current values
+let C={r:0.029,tc:0.5,tf:0.02,umax:30,dt:0.01,cut:0};
+const f=(v,d)=>(v>=0?'+ ':'- ')+Math.abs(v).toFixed(d);
+function eqs(){if(!$('eq'))return;const k=cur.slice(0,4),a=C.tc/(C.tc+C.dt);
+  $('eq').innerHTML=
+'<b>制御則</b>（'+(C.dt*1000).toFixed(0)+' ms ごと、u [rad/s] は車輪の速度指令）\n'+
+'u = dψref − K1·(θ−θref) − K2·(ψ−ψref) − K3·dθ − K4·(dψ−dψref)\n'+
+'  = dψref '+f(-k[0],3)+'·(θ−θref) '+f(-k[1],4)+'·(ψ−ψref) '+f(-k[2],4)+'·dθ '+f(-k[3],4)+'·(dψ−dψref)\n'+
+'左車輪 = sat(u + Y·jx),  右車輪 = sat(u − Y·jx)\n'+
+'  sat: ±UMAX = ±'+C.umax+' rad/s,  Y = '+cur[9].toFixed(1)+' rad/s,  jx: ジョイスティック左右\n\n'+
+'<b>状態</b>\n'+
+'θ   [rad]   車体の傾き（前が +）\n'+
+'            θ ← α(θ + dθ·h) + (1−α)(θacc − TRIM),  α = TC/(TC+h) = '+a.toFixed(3)+',  h = '+(C.dt*1000).toFixed(0)+' ms\n'+
+'            TC = '+C.tc+' s,  TRIM = '+cur[4].toFixed(2)+'°,  θacc: 加速度から求めた傾き\n'+
+'dθ  [rad/s] 傾き速度 dθ/dt（ジャイロ、ピッチ軸）\n'+
+'ψ   [rad]   車体に対する車輪角（左右平均）\n'+
+'dψ  [rad/s] 車輪角速度 dψ/dt（ψ の差分を 1 次フィルタで平滑化、TF = '+C.tf+' s）\n\n'+
+'<b>目標（スマホ操縦）</b>\n'+
+'v* = jy·Vmax,  Vmax = '+cur[5].toFixed(2)+' m/s  (jy: ジョイスティック上下)\n'+
+'aref: |aref| ≤ Amax = '+cur[6].toFixed(2)+' m/s²,  |d aref/dt| ≤ Jerk = '+cur[7].toFixed(1)+' m/s³ で vref → v*\n'+
+'vref = ∫aref dt,  xref = ∫vref dt\n'+
+'θref = LeanFF·aref,  LeanFF = '+cur[8].toFixed(1)+' °/(m/s²)\n'+
+'ψref = xref/r − θref,  dψref = vref/r,  r = '+C.r+' m\n\n'+
+'<b>ゲインの意味</b>（K は負 → u = +|K|·誤差 で、倒れた方向へ車輪を回す）\n'+
+'K1 傾き      : 立て直す強さ。大きすぎると細かく振動、小さいと倒れる\n'+
+'K3 傾き速度  : 揺れのダンピング。小さいとふらつく、大きいとブルブル（高周波振動）\n'+
+'K2 車輪角    : その場に留まる力。小さいと流れる、大きいとゆっくり前後に揺れる\n'+
+'K4 車輪速度  : 前後の揺れ・走行時のダンピング\n'+
+'TRIM         : 前へ流れる → 減らす（負へ）、後ろへ流れる → 増やす'+
+(C.cut>0?'\n\n低電圧カットオフ: '+C.cut.toFixed(2)+' V':'');}
 $('rec').onclick=()=>send($('rec').classList.contains('on')?'recstop':'recstart');
 $('mark').onclick=()=>send('mark');
 </script></body></html>)HTML";
 
-void post(Action a, uint8_t param = 0, float value = 0) {
+void post(Action a, uint8_t param = 0, float value = 0, const char* name = "") {
   Msg m;
   m.action = a;
   m.param = param;
   m.value = value;
+  strncpy(m.name, name, sizeof(m.name) - 1);
   if (queue) xQueueSend(queue, &m, 0);
 }
 
@@ -194,8 +264,12 @@ void onEvent(AsyncWebSocket*, AsyncWebSocketClient*, AwsEventType type, void* ar
   } else if (!strcmp(buf, "stop")) {
     cmd_v = cmd_w = 0;
     stop_req = true;
-  } else if (!strcmp(buf, "save")) {
-    post(Action::kSave);
+  } else if (!strncmp(buf, "saveas,", 7)) {
+    post(Action::kSaveAs, 0, 0, buf + 7);
+  } else if (!strncmp(buf, "load,", 5)) {
+    post(Action::kLoadSet, 0, 0, buf + 5);
+  } else if (!strncmp(buf, "del,", 4)) {
+    post(Action::kDeleteSet, 0, 0, buf + 4);
   } else if (!strcmp(buf, "revert")) {
     post(Action::kRevert);
   } else if (!strcmp(buf, "getp")) {
@@ -264,8 +338,17 @@ void begin(const char* ssid, const char* password) {
     dl.next = 0;
     dl.total = log_src.count();
     dl.len = dl.off = 0;
+    // ?name=... names the file; keep it to safe characters
+    String name = req->hasParam("name") ? req->getParam("name")->value() : String("pendulum_log");
+    String safe;
+    for (char c : name) {
+      if (isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '-' || c == '.') safe += c;
+      if (safe.length() >= 48) break;
+    }
+    if (!safe.length()) safe = "pendulum_log";
+    if (!safe.endsWith(".csv")) safe += ".csv";
     AsyncWebServerResponse* resp = req->beginChunkedResponse("text/csv", fillChunk);
-    resp->addHeader("Content-Disposition", "attachment; filename=pendulum_log.csv");
+    resp->addHeader("Content-Disposition", "attachment; filename=" + safe);
     req->onDisconnect([] { endDownload(); });
     req->send(resp);
   });
