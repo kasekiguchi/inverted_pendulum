@@ -43,9 +43,13 @@ section.on{display:flex}
 .btn{font-size:16px;padding:10px 18px;border-radius:10px;border:0;background:#456;color:#fff;text-decoration:none}
 #rec.on{background:#c33}
 canvas{width:96%;height:140px;background:#1a1a1a;border-radius:6px}
-.p{width:94%;margin:5px 0}
-.p div{display:flex;justify-content:space-between;font-size:14px}
-.p input{width:100%}
+.p{width:94%;margin:6px 0}
+.p .h{display:flex;justify-content:space-between;align-items:center;font-size:14px;gap:6px}
+.p input[type=range]{width:100%}
+.ed{display:flex;align-items:center;gap:4px}
+.ed input{width:92px;font-size:16px;background:#222;color:#eee;border:1px solid #555;border-radius:6px;padding:4px;text-align:right}
+.ed button{width:34px;height:32px;font-size:18px;border:0;border-radius:6px;background:#345;color:#fff}
+.x{color:#999;font-size:12px;min-width:44px;text-align:right}
 #msg{min-height:1.2em;color:#8c8;font-size:14px}
 </style></head><body>
 <div id="st">connecting...</div>
@@ -71,24 +75,40 @@ canvas{width:96%;height:140px;background:#1a1a1a;border-radius:6px}
 const $=id=>document.getElementById(id);
 const st=$('st'),pad=$('pad'),knob=$('knob'),msg=$('msg');
 let ws,jx=0,jy=0,active=false;
-// tuning parameters: rel = multiplier of the saved value, off = offset, else absolute.
-// Absolute sliders are continuous (step any) so a saved value is shown exactly.
+// Tuning parameters. Each has a value (cur) edited by a slider, a number box or
+// -/+ buttons. Slider: rel = 0..2x the saved value, off = saved +-range,
+// otherwise absolute. f = step of the -/+ buttons (rel: 1 % of the saved value).
 const P=[{n:'K1 tilt',k:'rel'},{n:'K2 wheel angle',k:'rel'},{n:'K3 tilt rate',k:'rel'},{n:'K4 wheel speed',k:'rel'},
- {n:'TRIM [deg]',k:'off',min:-3,max:3,s:0.05},{n:'top speed [m/s]',min:0.1,max:1.2,s:0.05},
- {n:'accel [m/s2]',min:0.2,max:2,s:0.05},{n:'jerk [m/s3]',min:0.5,max:10,s:0.5},
- {n:'lean FF [deg/(m/s2)]',min:0,max:25,s:0.5},{n:'turn [rad/s]',min:-8,max:8,s:0.5}];
-const base=new Array(P.length).fill(0),dirty=new Set();
+ {n:'TRIM [deg]',k:'off',min:-3,max:3,f:0.05,d:2},{n:'top speed [m/s]',min:0.1,max:1.2,f:0.05,d:2},
+ {n:'accel [m/s2]',min:0.2,max:2,f:0.05,d:2},{n:'jerk [m/s3]',min:0.5,max:10,f:0.1,d:1},
+ {n:'lean FF [deg/(m/s2)]',min:0,max:25,f:0.1,d:1},{n:'turn [rad/s]',min:-8,max:8,f:0.1,d:1}];
+const base=new Array(P.length).fill(0),cur=new Array(P.length).fill(0),dirty=new Set();
+const clamp=(v,a,b)=>Math.min(b,Math.max(a,v));
 P.forEach((p,i)=>{const d=document.createElement('div');d.className='p';
   const rel=p.k==='rel';
-  d.innerHTML='<div><span>'+p.n+'</span><span id="v'+i+'">-</span></div><input type="range" id="r'+i+'" min="'
+  d.innerHTML='<div class="h"><span>'+p.n+'</span><span class="ed"><span class="x" id="x'+i+'"></span>'
+   +'<button id="m'+i+'">&minus;</button><input type="number" inputmode="decimal" step="any" id="n'+i+'">'
+   +'<button id="q'+i+'">+</button></span></div><input type="range" id="r'+i+'" min="'
    +(rel?0:p.min)+'" max="'+(rel?2:p.max)+'" step="'+(rel?0.01:'any')+'">';
   $('params').appendChild(d);
-  $('r'+i).addEventListener('input',()=>{show(i);dirty.add(i)});});
-function val(i){const r=parseFloat($('r'+i).value),p=P[i];return p.k==='rel'?base[i]*r:p.k==='off'?base[i]+r:r}
-function show(i){const p=P[i],v=val(i);$('v'+i).textContent=(p.k==='rel'?v.toFixed(3)+'  (x'+parseFloat($('r'+i).value).toFixed(2)+')':v.toFixed(2))}
-setInterval(()=>{dirty.forEach(i=>send('set,'+i+','+val(i).toFixed(5)));dirty.clear()},100);
-function setParams(a){a.forEach((v,i)=>{if(i>=P.length)return;base[i]=v;const p=P[i];
-  $('r'+i).value=p.k==='rel'?1:p.k==='off'?0:v;show(i)});}
+  $('r'+i).addEventListener('input',()=>{const r=parseFloat($('r'+i).value);
+    cur[i]=rel?base[i]*r:p.k==='off'?base[i]+r:r;sync(i,'r')});
+  $('n'+i).addEventListener('change',()=>{const v=parseFloat($('n'+i).value);
+    // a gain must keep the sign of the saved one (the robot enforces it too): reject, show the current value
+    if(isFinite(v)&&!(rel&&base[i]*v<0)){cur[i]=v;sync(i,'n')}else sync(i,undefined,true)});
+  $('m'+i).onclick=()=>{cur[i]-=stepOf(i);sync(i)};
+  $('q'+i).onclick=()=>{cur[i]+=stepOf(i);sync(i)};});
+function stepOf(i){const p=P[i];return p.k==='rel'?(Math.abs(base[i])*0.01||0.001):p.f}
+function digits(i){const p=P[i];if(p.k!=='rel')return p.d;const a=Math.abs(base[i]);return a>=10?2:a>=1?3:4}
+// Refresh the widgets from cur[i] (except the one being edited) and queue it for sending.
+function sync(i,from,quiet){const p=P[i];
+  if(p.k==='rel'&&base[i]&&cur[i]*base[i]<0){cur[i]=0;from=undefined}  // -/+ stepped past zero
+  if(from!=='r')$('r'+i).value=p.k==='rel'?clamp(base[i]?cur[i]/base[i]:1,0,2):p.k==='off'?clamp(cur[i]-base[i],p.min,p.max):clamp(cur[i],p.min,p.max);
+  if(from!=='n')$('n'+i).value=cur[i].toFixed(digits(i));
+  $('x'+i).textContent=p.k==='rel'&&base[i]?'x'+(cur[i]/base[i]).toFixed(2):p.k==='off'?(cur[i]-base[i]>=0?'+':'')+(cur[i]-base[i]).toFixed(2):'';
+  if(!quiet)dirty.add(i)}
+setInterval(()=>{dirty.forEach(i=>send('set,'+i+','+cur[i].toPrecision(6)));dirty.clear()},100);
+function setParams(a){a.forEach((v,i)=>{if(i>=P.length)return;base[i]=cur[i]=v;sync(i,undefined,true)});}
 // plot
 const cv=$('plot'),cx=cv.getContext('2d'),TH=[],U=[];
 function plot(){const w=cv.width,h=cv.height;cx.clearRect(0,0,w,h);cx.strokeStyle='#333';cx.beginPath();cx.moveTo(0,h/2);cx.lineTo(w,h/2);cx.stroke();
