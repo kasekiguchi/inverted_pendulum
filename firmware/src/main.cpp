@@ -27,6 +27,10 @@ constexpr uint32_t kDtUs = 10000;  // control period; keep in sync with params.t
 constexpr float kDt = kDtUs * 1e-6f;
 
 constexpr uint32_t kParamsVersion = 2;
+// Calibration is rejected when the gyro spread exceeds this (i.e. the robot is
+// being rotated). Averaging keeps the bias error ~sd/sqrt(n), so a few dps of
+// hand-held jitter is fine.
+constexpr float kCalMaxSdDps = 3.0f;
 
 struct Params {
   uint32_t version = kParamsVersion;
@@ -242,7 +246,7 @@ void calibrate(float sec, bool upright) {
     var -= g[i] * g[i];
   }
   const float sd_dps = sqrtf(fmaxf(var, 0)) * RAD_TO_DEG;
-  if (sd_dps > 1.0f) {
+  if (sd_dps > kCalMaxSdDps) {
     memcpy(P.gyro_bias, saved, sizeof(saved));
     Serial.printf("# calibration skipped: moving (gyro sd %.2f dps)\n", sd_dps);
     return;
