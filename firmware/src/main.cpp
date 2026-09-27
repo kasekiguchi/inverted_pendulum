@@ -95,6 +95,12 @@ float x[4] = {0, 0, 0, 0};
 float u = 0;
 Deriv dpsi;
 
+// Consecutive samples with the command at its limit. The wheel-angle feedback
+// is positive, so a body that cannot tilt (held in the hand, wheels off the
+// floor) makes the wheels run away; stop that instead of driving off.
+constexpr int kSatAbortSamples = 30;
+int sat_count = 0;
+
 float step_u = 0, step_dur = 0;
 uint32_t step_t0 = 0;
 
@@ -194,6 +200,7 @@ void control(uint32_t now_ms) {
     case State::kArmed:
       if (fabsf(th) < P.arm_window_deg * DEG_TO_RAD) {
         startFromHere();
+        sat_count = 0;
         setOutput(true);
         enter(State::kRun);
       }
@@ -208,6 +215,13 @@ void control(uint32_t now_ms) {
       float s = 0;
       for (int i = 0; i < 4; ++i) s -= P.K[i] * x[i];
       u = constrain(s, -P.u_max, P.u_max);
+      sat_count = fabsf(s) >= P.u_max ? sat_count + 1 : 0;
+      if (sat_count > kSatAbortSamples) {
+        Serial.printf("# abort: command saturated for %d ms (body held or wheels off the floor?)\n",
+                      kSatAbortSamples * static_cast<int>(kDtUs / 1000));
+        enter(State::kIdle);
+        return;
+      }
       sendSpeed(u);
       return;
     }
