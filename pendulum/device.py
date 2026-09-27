@@ -17,10 +17,32 @@ class Device:
     def __init__(self, port: str, baud: int = BAUD):
         s = serial.Serial()
         s.port, s.baudrate, s.timeout = port, baud, 0.1
-        # The FIRE's auto-reset circuit reboots the ESP32 when DTR/RTS toggle.
-        s.dtr = s.rts = False
-        s.open()
+        s.open()  # the OS asserts DTR and RTS together here
+        # The FIRE's auto-reset circuit pulls EN low while RTS is asserted and
+        # DTR is not. Releasing RTS before DTR never passes through that state.
+        s.rts = False
+        s.dtr = False
         self.ser = s
+        self._sync()
+
+    def _sync(self):
+        """Wait for the firmware if opening the port rebooted it, then drop any partial line."""
+        start = time.monotonic()
+        got_data = ready = False
+        last = start
+        while time.monotonic() - start < 4.0:
+            raw = self.ser.readline()
+            now = time.monotonic()
+            if raw:
+                got_data, last = True, now
+                ready |= b"# ready" in raw
+            elif now - last > 0.3 and (ready or not got_data):
+                break
+        if ready:
+            print("# note: the board rebooted when the port was opened; unsaved settings were reset")
+        self.ser.write(b"\n")
+        time.sleep(0.05)
+        self.ser.reset_input_buffer()
 
     def close(self):
         self.ser.close()

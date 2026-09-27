@@ -333,6 +333,8 @@ void pollSerial() {
         handleCommand(buf);
         n = 0;
       }
+    } else if (c < 0x20 || c > 0x7e) {
+      n = 0;  // noise (e.g. from a port reset): drop the partial line
     } else if (n < sizeof(buf) - 1) {
       buf[n++] = c;
     }
