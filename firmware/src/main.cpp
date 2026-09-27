@@ -288,6 +288,17 @@ void printRollerInfo(roller::Roller& r, const char* name) {
                 spd * 0.01f);
 }
 
+// Speed PID raw register values (library scaling: P/1e5, I/1e7, D/1e5).
+void printSpeedPid(roller::Roller& r, const char* name) {
+  uint32_t pid[3] = {0, 0, 0};
+  if (!r.read(roller::kSpeedPid, pid, sizeof(pid))) {
+    Serial.printf("# %s: speed PID read failed\n", name);
+    return;
+  }
+  Serial.printf("# %s speed PID raw %lu %lu %lu (P=%.5f I=%.7f D=%.5f)\n", name, (unsigned long)pid[0],
+                (unsigned long)pid[1], (unsigned long)pid[2], pid[0] / 1e5, pid[1] / 1e7, pid[2] / 1e5);
+}
+
 void printImuInfo() {
   readImu();
   Serial.printf("# imu(0x68): whoami=0x%02X acc=%.2f %.2f %.2f m/s2 gyro=%.2f %.2f %.2f dps th_acc=%.2fdeg th=%.2fdeg\n",
@@ -374,6 +385,8 @@ bool handleCommand(char* line) {
     if (!idle) return err("INFO is IDLE only");
     printRollerInfo(left, "left");
     printRollerInfo(right, "right");
+    printSpeedPid(left, "left");
+    printSpeedPid(right, "right");
     printImuInfo();
   } else if (!strcmp(cmd, "SETADDR")) {
     // Connect only the roller to be changed. SETADDR <old> <new>, decimal or 0x..
@@ -389,6 +402,19 @@ bool handleCommand(char* line) {
     delay(100);
     Serial.printf("# address 0x%02X -> 0x%02X, now %s\n", from, to,
                   roller::Roller(Wire, to).ping() ? "responding" : "NOT responding");
+  } else if (!strcmp(cmd, "SPID")) {
+    // SPID            : print both rollers' speed PID
+    // SPID p i d      : write raw values to both (not persisted in the roller; FIRE re-sends nothing)
+    const char* a = strtok(nullptr, " \t");
+    if (a) {
+      const char* b = strtok(nullptr, " \t");
+      const char* c = strtok(nullptr, " \t");
+      if (!idle || !b || !c) return err("SPID p i d (raw, IDLE only)");
+      const uint32_t pid[3] = {strtoul(a, nullptr, 0), strtoul(b, nullptr, 0), strtoul(c, nullptr, 0)};
+      for (auto* r : {&left, &right}) r->write(roller::kSpeedPid, pid, sizeof(pid));
+    }
+    printSpeedPid(left, "left");
+    printSpeedPid(right, "right");
   } else if (!strcmp(cmd, "SETUP")) {
     if (idle) setupRollers();
   } else {

@@ -73,3 +73,49 @@ def fit_step(t: np.ndarray, u: np.ndarray, p: np.ndarray, max_delay: int = 5) ->
     tau, d, _ = best
     fit = simulate_first_order(t, u, tau, d)
     return {"tau": tau, "delay_steps": d, "fit": fit, "rms": float(np.sqrt(np.mean((fit - p) ** 2)))}
+
+
+def simulate_second_order(t, u, k, wn, zeta, tz, delay_steps=0):
+    """Angle response for psi'/u = k wn^2 (tz s + 1) / (s^2 + 2 zeta wn s + wn^2), exact ZOH per sample."""
+    from scipy.linalg import expm
+
+    A = np.array([[0, 0, k * wn**2, k * wn**2 * tz], [0, 0, 0, 0], [0, 0, 0, 1], [0, 0, -(wn**2), -2 * zeta * wn]])
+    # state [psi, (unused), z, z']; input enters z''
+    A = np.delete(np.delete(A, 1, 0), 1, 1)
+    B = np.array([0.0, 0.0, 1.0])
+    ud = np.concatenate([np.zeros(delay_steps), u[: len(u) - delay_steps]])
+    cache = {}
+    x = np.zeros(3)
+    out = np.zeros_like(t)
+    for i in range(1, len(t)):
+        h = round(float(t[i] - t[i - 1]), 4)
+        if h not in cache:
+            M = np.zeros((4, 4))
+            M[:3, :3], M[:3, 3] = A, B
+            E = expm(M * h)
+            cache[h] = (E[:3, :3], E[:3, 3])
+        Ad, Bd = cache[h]
+        x = Ad @ x + Bd * ud[i - 1]
+        out[i] = x[0]
+    return out
+
+
+def fit_step2(t: np.ndarray, u: np.ndarray, p: np.ndarray, max_delay: int = 3) -> dict:
+    """Fit a second-order speed loop (with a zero) to the measured wheel angle."""
+    from scipy.optimize import least_squares
+
+    t = t - t[0]
+    p = p - p[0]
+    best = None
+    for d in range(max_delay + 1):
+        res = least_squares(
+            lambda x: simulate_second_order(t, u, *x, d) - p,
+            x0=[1.0, 60.0, 0.3, 0.01],
+            bounds=([0.5, 5.0, 0.02, -0.1], [1.5, 500.0, 3.0, 0.2]),
+        )
+        if best is None or res.cost < best[2]:
+            best = (res.x, d, res.cost)
+    (k, wn, zeta, tz), d, _ = best
+    fit = simulate_second_order(t, u, k, wn, zeta, tz, d)
+    return {"k": k, "wn": wn, "zeta": zeta, "tz": tz, "delay_steps": d, "fit": fit,
+            "rms": float(np.sqrt(np.mean((fit - p) ** 2)))}

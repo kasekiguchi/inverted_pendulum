@@ -11,7 +11,7 @@ import numpy as np
 
 from . import ident
 from .device import Device, load_log
-from .model import Params, design, simulate
+from .model import Params, closed_loop_poles, design, design_output_feedback, simulate
 
 
 def update_toml(path: str, updates: dict[str, float]):
@@ -20,7 +20,7 @@ def update_toml(path: str, updates: dict[str, float]):
     for key, val in updates.items():
         text, n = re.subn(
             rf"^({re.escape(key)}\s*=\s*)[^#\n]*?(\s*(#.*)?)$",
-            lambda m: f"{m.group(1)}{val:.4g}{m.group(2)}",
+            lambda m: f"{m.group(1)}{val if isinstance(val, int) else f'{val:.4g}'}{m.group(2)}",
             text,
             count=1,
             flags=re.M,
@@ -29,6 +29,15 @@ def update_toml(path: str, updates: dict[str, float]):
             raise KeyError(f"{key} not found in {path}")
     Path(path).write_text(text)
     print(f"updated {path}: " + ", ".join(f"{k}={v:.4g}" for k, v in updates.items()))
+
+
+def print_poles(z, dt, label):
+    s = np.log(z.astype(complex)) / dt
+    worst = np.max(np.abs(z))
+    print(f"{label}: max|z| = {worst:.4f} {'(UNSTABLE)' if worst >= 1 else ''}")
+    for zi, si in sorted(zip(z, s), key=lambda t: -abs(t[0]))[:4]:
+        zeta = -si.real / abs(si) if abs(si) > 0 else 1.0
+        print(f"  |z|={abs(zi):.4f}  s={si.real:+8.2f}{si.imag:+8.2f}j  zeta={zeta:.2f}")
 
 
 def gain_command(K) -> str:
@@ -45,21 +54,30 @@ def cmd_design(a):
 
     p = Params.load(a.params)
     K, poles = design(p)
-    s_poles = np.log(poles.astype(complex)) / p.dt
-    print("K (u = -K x, x = [th, psi, dth, dpsi]):")
+    print("LQR on the first-order motor model, K (u = -K x, x = [th, psi, dth, dpsi]):")
     print("  " + "  ".join(f"{k:+.4f}" for k in K))
-    print("closed-loop poles (continuous equiv.):")
-    for s in s_poles:
-        print(f"  {s.real:+8.2f} {s.imag:+8.2f}j   |z|={abs(np.exp(s * p.dt)):.4f}")
+    print_poles(poles, p.dt, "  poles (design model)")
+    if p.has_motor2:
+        print(f"measured motor model: wn={p.motor_wn:.1f} rad/s zeta={p.motor_zeta:.2f} "
+              f"tz={p.motor_tz * 1e3:.0f} ms delay={p.motor_delay} samples")
+        print_poles(closed_loop_poles(p, K, True, p.motor_delay), p.dt, "  LQR gain on the measured model")
+        if not a.lqr_only:
+            try:
+                K = design_output_feedback(p, K)
+            except RuntimeError as e:
+                raise SystemExit(str(e))
+            print("gains optimised on the measured motor model:")
+            print("  " + "  ".join(f"{k:+.4f}" for k in K))
+            print_poles(closed_loop_poles(p, K, True, p.motor_delay), p.dt, "  optimised gain on the measured model")
     print("firmware command:\n  " + gain_command(K))
 
     print(f"lean needed per 1 m/s^2 of acceleration: {np.rad2deg(p.lean_per_accel()):.1f} deg "
           f"(l = {p.l * 1e3:.1f} mm)")
 
-    x0 = [np.deg2rad(p.th0_deg), 0, 0, 0]
-    log = simulate(p, K, x0, p.t_end)
+    log = simulate(p, K, np.deg2rad(p.th0_deg), p.t_end)
     sat = np.mean(np.abs(log["u"]) >= p.u_max - 1e-9)
-    print(f"simulation (th0={p.th0_deg} deg, tilt bias={p.theta_bias_deg} deg): "
+    print(f"simulation ({'measured' if p.has_motor2 else 'first-order'} motor, th0={p.th0_deg} deg, "
+          f"tilt bias={p.theta_bias_deg} deg): "
           f"{'FELL' if log['fell'] else 'ok'}, max|travel|={np.max(np.abs(log['travel'])):.3f} m, "
           f"final travel={log['travel'][-1]:+.3f} m, max|u|={np.max(np.abs(log['u'])):.1f} rad/s, "
           f"saturated {sat:.0%} of samples")
@@ -171,15 +189,24 @@ def cmd_fit_step(a):
     if not m.any():
         raise SystemExit("no STEP samples in log")
     t, u, p = log["t"][m], log["u"][m], log["psi"][m]
-    r = ident.fit_step(t, u, p)
-    print(f"motor_tau = {r['tau'] * 1e3:.1f} ms, delay = {r['delay_steps']} samples, "
-          f"fit rms = {np.rad2deg(r['rms']):.2f} deg")
+    r1 = ident.fit_step(t, u, p)
+    print(f"first order : tau = {r1['tau'] * 1e3:.1f} ms, delay = {r1['delay_steps']} samples, "
+          f"fit rms = {np.rad2deg(r1['rms']):.2f} deg")
+    r2 = ident.fit_step2(t, u, p)
+    print(f"second order: k = {r2['k']:.3f}, wn = {r2['wn']:.1f} rad/s, zeta = {r2['zeta']:.3f}, "
+          f"tz = {r2['tz'] * 1e3:.1f} ms, delay = {r2['delay_steps']} samples, fit rms = {np.rad2deg(r2['rms']):.2f} deg")
     if a.update:
-        update_toml(a.params, {"motor_tau": r["tau"]})
+        # the design model is first order; take its time constant from the second-order fit's
+        # 63 % rise so a wrong first-order fit (e.g. tau at the bound) does not leak in.
+        tau = max(r1["tau"], 1.0 / r2["wn"])
+        update_toml(a.params, {"motor_tau": tau, "motor_k": r2["k"], "motor_wn": r2["wn"],
+                               "motor_zeta": r2["zeta"], "motor_tz": r2["tz"],
+                               "motor_delay": int(r2["delay_steps"])})
     tt = t - t[0]
     fig, ax = plt.subplots(2, 1, sharex=True)
     ax[0].plot(tt, p - p[0], ".", ms=2, label="measured")
-    ax[0].plot(tt, r["fit"], label="fit")
+    ax[0].plot(tt, r1["fit"], label="first order")
+    ax[0].plot(tt, r2["fit"], label="second order")
     ax[0].set_ylabel("psi [rad]")
     ax[0].legend()
     ax[1].plot(tt, u)
@@ -199,6 +226,7 @@ def main(argv=None):
     s.add_argument("--send", metavar="PORT", help="send K/TF/UMAX/R to the device")
     s.add_argument("--save", action="store_true", help="also SAVE to device flash")
     s.add_argument("--no-plot", action="store_true")
+    s.add_argument("--lqr-only", action="store_true", help="skip the optimisation on the measured motor model")
     s.set_defaults(func=cmd_design)
 
     s = sub.add_parser("term", help="interactive serial console")
