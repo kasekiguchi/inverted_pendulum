@@ -14,6 +14,7 @@
 #include <esp_heap_caps.h>
 
 #include "imu.h"
+#include "remote.h"
 #include "roller.h"
 
 namespace {
@@ -28,6 +29,7 @@ constexpr uint32_t kDtUs = 10000;  // control period; keep in sync with params.t
 constexpr float kDt = kDtUs * 1e-6f;
 
 constexpr uint32_t kParamsVersion = 2;
+constexpr char kWifiPassword[] = "pendulum";  // smartphone remote (8+ chars)
 // Calibration is rejected when the gyro spread exceeds this (i.e. the robot is
 // being rotated). Averaging keeps the bias error ~sd/sqrt(n), so a few dps of
 // hand-held jitter is fine.
@@ -56,6 +58,11 @@ struct Params {
   // the roller's own menu has SPEED PID = User-Def. Default: Qiita article values
   // (P2 D850) plus a small I, which removes the stiction dead band at low speed.
   uint32_t speed_pid[3] = {200000, 30000, 85000000};
+  // Smartphone driving: full-stick forward speed, acceleration limit (the body
+  // must lean ~13 deg per m/s^2), and full-stick wheel speed difference for turning.
+  float drive_vmax = 0.3f;  // m/s
+  float drive_amax = 0.3f;  // m/s^2
+  float drive_yaw = 4.0f;   // rad/s added to one wheel and subtracted from the other
 };
 
 enum class State : uint8_t { kIdle = 0, kArmed = 1, kRun = 2, kStep = 3 };
@@ -104,6 +111,8 @@ constexpr int kSatAbortSamples = 30;
 int sat_count = 0;
 
 float vin = 0;  // left roller supply voltage, refreshed every 100 ms
+float v_ref = 0, psi_ref = 0, yaw = 0;  // driving reference (see updateReference)
+char ssid[24] = "";
 
 // On-board recorder: keeps the most recent kRecCap samples taken while not
 // IDLE (plus 1 s after), so runs without the USB cable can be dumped later.
@@ -111,7 +120,7 @@ struct Rec {
   uint32_t t_ms;
   uint8_t state;
   uint16_t exec_us;
-  float th, psi, dth, dpsi, u, th_acc, vin;
+  float th, psi, dth, dpsi, u, th_acc, vin, v_ref, yaw;
 };
 constexpr size_t kRecCap = 6000;  // 60 s at 100 Hz, in PSRAM
 Rec* rec_buf = nullptr;
@@ -136,8 +145,9 @@ void recPush(const Rec& r) {
 }
 
 void printRec(const Rec& r) {
-  Serial.printf("D,%lu,%u,%.5f,%.5f,%.4f,%.4f,%.4f,%.5f,%u,%.2f\n", (unsigned long)r.t_ms, (unsigned)r.state, r.th,
-                r.psi, r.dth, r.dpsi, r.u, r.th_acc, (unsigned)r.exec_us, r.vin);
+  Serial.printf("D,%lu,%u,%.5f,%.5f,%.4f,%.4f,%.4f,%.5f,%u,%.2f,%.3f,%.2f\n", (unsigned long)r.t_ms,
+                (unsigned)r.state, r.th, r.psi, r.dth, r.dpsi, r.u, r.th_acc, (unsigned)r.exec_us, r.vin, r.v_ref,
+                r.yaw);
 }
 
 float step_u = 0, step_dur = 0;
@@ -181,10 +191,13 @@ void setOutput(bool on) {
   }
 }
 
-void sendSpeed(float u_rad_s) {
-  const float rpm100 = u_rad_s * 60.0f / (2.0f * PI) * 100.0f;
-  if (!left.writeI32(roller::kSpeed, lroundf(P.sgn_l * rpm100))) ++i2c_errors;
-  if (!right.writeI32(roller::kSpeed, lroundf(P.sgn_r * rpm100))) ++i2c_errors;
+// u: common wheel speed, yaw_rad_s: added to the left wheel and subtracted from the right.
+void sendSpeed(float u_rad_s, float yaw_rad_s = 0) {
+  constexpr float kToRpm100 = 60.0f / (2.0f * PI) * 100.0f;
+  const float l = constrain(u_rad_s + yaw_rad_s, -P.u_max, P.u_max) * kToRpm100;
+  const float r = constrain(u_rad_s - yaw_rad_s, -P.u_max, P.u_max) * kToRpm100;
+  if (!left.writeI32(roller::kSpeed, lroundf(P.sgn_l * l))) ++i2c_errors;
+  if (!right.writeI32(roller::kSpeed, lroundf(P.sgn_r * r))) ++i2c_errors;
 }
 
 void enter(State s) {
@@ -229,6 +242,18 @@ void startFromHere() {
   x[1] = 0;
   dpsi.reset(psi_raw);
   x[3] = 0;
+  v_ref = psi_ref = yaw = 0;
+}
+
+// Moves the reference with the smartphone command: v_ref is rate-limited, the
+// wheel-angle reference is its integral, and the yaw difference is rate-limited too.
+void updateReference(uint32_t now_ms) {
+  const remote::Cmd c = remote::get(now_ms);
+  const float dv = constrain(c.v * P.drive_vmax - v_ref, -P.drive_amax * kDt, P.drive_amax * kDt);
+  v_ref += dv;
+  psi_ref += v_ref / P.wheel_r * kDt;
+  constexpr float kYawRate = 20.0f;  // rad/s^2
+  yaw += constrain(c.w * P.drive_yaw - yaw, -kYawRate * kDt, kYawRate * kDt);
 }
 
 void control(uint32_t now_ms) {
@@ -245,14 +270,18 @@ void control(uint32_t now_ms) {
       }
       return;
     case State::kRun: {
-      const float travel = P.wheel_r * (x[0] + x[1]);
+      updateReference(now_ms);
+      // travel is measured from the moving reference, so driving does not trip XLIM
+      const float travel = P.wheel_r * (x[0] + x[1] - psi_ref);
       if (fabsf(th) > P.th_limit_deg * DEG_TO_RAD || fabsf(travel) > P.x_limit || i2c_errors > 5) {
         Serial.printf("# abort th=%.1fdeg travel=%.3fm i2c_err=%u\n", th * RAD_TO_DEG, travel, i2c_errors);
         enter(State::kIdle);
         return;
       }
-      float s = 0;
-      for (int i = 0; i < 4; ++i) s -= P.K[i] * x[i];
+      const float dpsi_ref = v_ref / P.wheel_r;
+      const float e[4] = {x[0], x[1] - psi_ref, x[2], x[3] - dpsi_ref};
+      float s = dpsi_ref;  // feed-forward: the speed loop needs the reference speed
+      for (int i = 0; i < 4; ++i) s -= P.K[i] * e[i];
       u = constrain(s, -P.u_max, P.u_max);
       sat_count = fabsf(s) >= P.u_max ? sat_count + 1 : 0;
       if (sat_count > kSatAbortSamples) {
@@ -261,7 +290,7 @@ void control(uint32_t now_ms) {
         enter(State::kIdle);
         return;
       }
-      sendSpeed(u);
+      sendSpeed(u, yaw);
       return;
     }
     case State::kStep: {
@@ -325,6 +354,7 @@ void printParams() {
                 P.tc, P.tf);
   Serial.printf("# UMAX %g\n# THLIM %g\n# XLIM %g\n# ARMW %g\n# IMAX %ld\n# DT %g\n", P.u_max, P.th_limit_deg,
                 P.x_limit, P.arm_window_deg, (long)P.max_current_ma, kDt);
+  Serial.printf("# DRIVE %g %g %g\n", P.drive_vmax, P.drive_amax, P.drive_yaw);
   Serial.printf("# SPID %lu %lu %lu\n", (unsigned long)P.speed_pid[0], (unsigned long)P.speed_pid[1],
                 (unsigned long)P.speed_pid[2]);
 }
@@ -430,6 +460,10 @@ bool handleCommand(char* line) {
   } else if (!strcmp(cmd, "TC")) { set(P.tc);
   } else if (!strcmp(cmd, "TF")) { set(P.tf);
   } else if (!strcmp(cmd, "UMAX")) { set(P.u_max);
+  } else if (!strcmp(cmd, "DRIVE")) {  // DRIVE vmax[m/s] amax[m/s^2] yaw[rad/s]
+    set(P.drive_vmax);
+    set(P.drive_amax);
+    set(P.drive_yaw);
   } else if (!strcmp(cmd, "THLIM")) { set(P.th_limit_deg);
   } else if (!strcmp(cmd, "XLIM")) { set(P.x_limit);
   } else if (!strcmp(cmd, "ARMW")) { set(P.arm_window_deg);
@@ -541,6 +575,7 @@ void drawLcd() {
   d.printf("psi  %+8.1f deg\n", x[1] * RAD_TO_DEG);
   d.printf("u    %+8.2f rad/s\n", u);
   d.printf("vin  %6.2f V  rec %4u\n", vin, (unsigned)rec_count);
+  d.printf("wifi %s\n", ssid);
   d.printf("\n A:ARM  B:STOP  C:CAL");
 }
 
@@ -561,6 +596,11 @@ void setup() {
 
   loadParams();
   recAlloc();
+  {
+    snprintf(ssid, sizeof(ssid), "pendulum-%04X", static_cast<unsigned>(ESP.getEfuseMac() >> 32) & 0xFFFF);
+    remote::begin(ssid, kWifiPassword);
+    Serial.printf("# wifi AP %s / %s -> http://192.168.4.1\n", ssid, kWifiPassword);
+  }
   delay(500);  // let the rollers boot
   if (!left.ping() || !right.ping()) Serial.println("# ERR roller not found; check wiring/addresses (INFO)");
   if (!imu.begin()) Serial.println("# ERR IMU not found");
@@ -591,13 +631,20 @@ void loop() {
   }
 
   const Rec r{now_ms, static_cast<uint8_t>(state), static_cast<uint16_t>(min<uint32_t>(exec_us, 65535)),
-              x[0], x[1], x[2], x[3], u, th_acc, vin};
+              x[0], x[1], x[2], x[3], u, th_acc, vin, v_ref, yaw};
   if (state != State::kIdle) last_active_ms = now_ms;
   if (state != State::kIdle || now_ms - last_active_ms < 1000) recPush(r);
   if (logging) printRec(r);
 
   pollSerial();
   pollButtons();
+  if (remote::takeStop()) enter(State::kIdle);
+  if (remote::takeArm() && state == State::kIdle) enter(State::kArmed);
+  static uint32_t pub_ms = 0;
+  if (now_ms - pub_ms > 200) {
+    pub_ms = now_ms;
+    remote::publish(stateName(state), th * RAD_TO_DEG, vin, v_ref);
+  }
   // LCD drawing takes several ms over SPI, so only refresh it while not balancing.
   const bool busy = state == State::kRun || state == State::kStep;
   if (!busy && now_ms - lcd_ms > 200) {

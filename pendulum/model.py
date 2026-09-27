@@ -237,10 +237,14 @@ def dynamics(p: Params, x: np.ndarray, u: float, motor) -> np.ndarray:
 
 
 def simulate(p: Params, K: np.ndarray, th0: float, t_end: float, second: bool | None = None,
-             substeps: int = 10) -> dict:
+             substeps: int = 10, v_target=None, a_max: float = 0.3) -> dict:
     """Nonlinear simulation reproducing the firmware loop: tilt measured with a
     constant bias (trim error), quantised wheel encoders, filtered-derivative
-    wheel speed, saturation and ZOH. Uses the second-order motor if identified."""
+    wheel speed, saturation and ZOH. Uses the second-order motor if identified.
+
+    v_target(t) [m/s] drives the robot like the remote control in the firmware:
+    the reference speed is rate-limited by a_max, the wheel-angle reference is
+    its integral, and u = dpsi_ref - K (x - x_ref)."""
     if second is None:
         second = p.has_motor2
     motor = motor_ss(p, second)
@@ -255,18 +259,24 @@ def simulate(p: Params, K: np.ndarray, th0: float, t_end: float, second: bool | 
     u_queue = [0.0] * delay
     psim_old = 0.0
     dpsih = 0.0
-    names = ("t", "th", "psi", "dth", "dpsi", "u", "travel")
+    v_ref = psi_ref = 0.0
+    names = ("t", "th", "psi", "dth", "dpsi", "u", "travel", "v_ref")
     log = {k: np.zeros(n) for k in names}
     for k in range(n):
         psim = np.round(x[1] / q_psi) * q_psi
         dpsih = (2 * (psim - psim_old) + (2 * p.tf - h) * dpsih) / (2 * p.tf + h)
         psim_old = psim
-        xh = np.array([x[0] + bias, psim, x[2], dpsih])
-        u_cmd = float(np.clip(-K @ xh, -p.u_max, p.u_max))
+        if v_target is not None:
+            dv = v_target(k * h) - v_ref
+            v_ref += float(np.clip(dv, -a_max * h, a_max * h))
+            psi_ref += v_ref / p.wheel_radius * h
+        dpsi_ref = v_ref / p.wheel_radius
+        xh = np.array([x[0] + bias, psim - psi_ref, x[2], dpsih - dpsi_ref])
+        u_cmd = float(np.clip(dpsi_ref - K @ xh, -p.u_max, p.u_max))
         u_queue.append(u_cmd)
         u = u_queue.pop(0)
         dpsi = (motor[2] @ x[3:]).item()
-        for name, val in zip(names, (k * h, x[0], x[1], x[2], dpsi, u_cmd, p.wheel_radius * (x[0] + x[1]))):
+        for name, val in zip(names, (k * h, x[0], x[1], x[2], dpsi, u_cmd, p.wheel_radius * (x[0] + x[1]), v_ref)):
             log[name][k] = val
         dt = h / substeps
         for _ in range(substeps):  # RK4
