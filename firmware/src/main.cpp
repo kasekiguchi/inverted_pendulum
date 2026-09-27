@@ -11,6 +11,7 @@
 #include <M5Unified.h>
 #include <Preferences.h>
 #include <Wire.h>
+#include <esp_heap_caps.h>
 
 #include "imu.h"
 #include "roller.h"
@@ -101,6 +102,43 @@ Deriv dpsi;
 // floor) makes the wheels run away; stop that instead of driving off.
 constexpr int kSatAbortSamples = 30;
 int sat_count = 0;
+
+float vin = 0;  // left roller supply voltage, refreshed every 100 ms
+
+// On-board recorder: keeps the most recent kRecCap samples taken while not
+// IDLE (plus 1 s after), so runs without the USB cable can be dumped later.
+struct Rec {
+  uint32_t t_ms;
+  uint8_t state;
+  uint16_t exec_us;
+  float th, psi, dth, dpsi, u, th_acc, vin;
+};
+constexpr size_t kRecCap = 6000;  // 60 s at 100 Hz, in PSRAM
+Rec* rec_buf = nullptr;
+size_t rec_cap = 0, rec_head = 0, rec_count = 0;
+uint32_t last_active_ms = 0;
+
+void recAlloc() {
+  rec_buf = static_cast<Rec*>(heap_caps_malloc(kRecCap * sizeof(Rec), MALLOC_CAP_SPIRAM));
+  rec_cap = kRecCap;
+  if (!rec_buf) {  // no PSRAM: fall back to 10 s in internal RAM
+    rec_cap = 1000;
+    rec_buf = static_cast<Rec*>(malloc(rec_cap * sizeof(Rec)));
+    if (!rec_buf) rec_cap = 0;
+  }
+}
+
+void recPush(const Rec& r) {
+  if (!rec_cap) return;
+  rec_buf[rec_head] = r;
+  rec_head = (rec_head + 1) % rec_cap;
+  if (rec_count < rec_cap) ++rec_count;
+}
+
+void printRec(const Rec& r) {
+  Serial.printf("D,%lu,%u,%.5f,%.5f,%.4f,%.4f,%.4f,%.5f,%u,%.2f\n", (unsigned long)r.t_ms, (unsigned)r.state, r.th,
+                r.psi, r.dth, r.dpsi, r.u, r.th_acc, (unsigned)r.exec_us, r.vin);
+}
 
 float step_u = 0, step_dur = 0;
 uint32_t step_t0 = 0;
@@ -401,6 +439,14 @@ bool handleCommand(char* line) {
       P.max_current_ma = static_cast<int32_t>(v);
       for (auto* r : {&left, &right}) r->writeI32(roller::kSpeedMaxCurrent, P.max_current_ma * 100);
     }
+  } else if (!strcmp(cmd, "DUMP")) {
+    if (!idle) return err("DUMP is IDLE only");
+    Serial.printf("# dump %u\n", (unsigned)rec_count);
+    const size_t start = (rec_head + rec_cap - rec_count) % (rec_cap ? rec_cap : 1);
+    for (size_t i = 0; i < rec_count; ++i) printRec(rec_buf[(start + i) % rec_cap]);
+    Serial.println("# dump end");
+  } else if (!strcmp(cmd, "CLEARLOG")) {
+    rec_head = rec_count = 0;
   } else if (!strcmp(cmd, "GET")) {
     printParams();
   } else if (!strcmp(cmd, "SAVE")) {
@@ -494,6 +540,7 @@ void drawLcd() {
   d.printf("dth  %+8.1f dps\n", x[2] * RAD_TO_DEG);
   d.printf("psi  %+8.1f deg\n", x[1] * RAD_TO_DEG);
   d.printf("u    %+8.2f rad/s\n", u);
+  d.printf("vin  %6.2f V  rec %4u\n", vin, (unsigned)rec_count);
   d.printf("\n A:ARM  B:STOP  C:CAL");
 }
 
@@ -513,6 +560,7 @@ void setup() {
   M5.Display.fillScreen(TFT_BLACK);
 
   loadParams();
+  recAlloc();
   delay(500);  // let the rollers boot
   if (!left.ping() || !right.ping()) Serial.println("# ERR roller not found; check wiring/addresses (INFO)");
   if (!imu.begin()) Serial.println("# ERR IMU not found");
@@ -535,10 +583,18 @@ void loop() {
   control(now_ms);
   const uint32_t exec_us = micros() - t0;
 
-  if (logging) {
-    Serial.printf("D,%lu,%u,%.5f,%.5f,%.4f,%.4f,%.4f,%.5f,%lu\n", (unsigned long)now_ms, (unsigned)state, x[0],
-                  x[1], x[2], x[3], u, th_acc, (unsigned long)exec_us);
+  static uint8_t vin_div = 0;
+  if (++vin_div >= 10) {
+    vin_div = 0;
+    int32_t v;
+    if (left.readI32(roller::kVin, v)) vin = v * 0.01f;
   }
+
+  const Rec r{now_ms, static_cast<uint8_t>(state), static_cast<uint16_t>(min<uint32_t>(exec_us, 65535)),
+              x[0], x[1], x[2], x[3], u, th_acc, vin};
+  if (state != State::kIdle) last_active_ms = now_ms;
+  if (state != State::kIdle || now_ms - last_active_ms < 1000) recPush(r);
+  if (logging) printRec(r);
 
   pollSerial();
   pollButtons();

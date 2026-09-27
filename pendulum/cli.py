@@ -100,7 +100,8 @@ def cmd_design(a):
 def plot_states(log, title):
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(4, 1, sharex=True, figsize=(8, 8))
+    has_vin = "vin" in log
+    fig, ax = plt.subplots(5 if has_vin else 4, 1, sharex=True, figsize=(8, 10 if has_vin else 8))
     t = log["t"]
     ax[0].plot(t, np.rad2deg(log["th"]), label="th")
     if "th_acc" in log:
@@ -113,7 +114,10 @@ def plot_states(log, title):
     ax[2].set_ylabel("dth [deg/s]")
     ax[3].plot(t, log["u"])
     ax[3].set_ylabel("u [rad/s]")
-    ax[3].set_xlabel("t [s]")
+    if has_vin:
+        ax[4].plot(t, log["vin"])
+        ax[4].set_ylabel("vin [V]")
+    ax[-1].set_xlabel("t [s]")
     for x in ax:
         x.grid(True)
     fig.suptitle(title)
@@ -148,6 +152,16 @@ def cmd_run(a):
         n = dev.record(out, a.duration, ["ARM"])
         dev.cmd("STOP", echo=False)
     print(f"wrote {n} rows to {out}")
+
+
+def cmd_dump(a):
+    """Download runs recorded on the FIRE without the USB cable."""
+    out = a.out or default_log_name("dump")
+    with Device(a.port) as dev:
+        n = dev.dump(out)
+        if a.clear and n:
+            dev.cmd("CLEARLOG", echo=False)
+    print(f"wrote {n} rows to {out}" + (" (recorder cleared)" if a.clear and n else ""))
 
 
 def cmd_plot(a):
@@ -324,6 +338,12 @@ def main(argv=None):
     s.add_argument("-u", type=float, default=10.0, help="step size [rad/s]")
     s.add_argument("-d", "--duration", type=float, default=1.0)
     s.set_defaults(func=cmd_step_sweep)
+
+    s = sub.add_parser("dump", help="download runs recorded on the FIRE (e.g. without USB)")
+    s.add_argument("port")
+    s.add_argument("-o", "--out")
+    s.add_argument("--clear", action="store_true", help="clear the on-board recorder afterwards")
+    s.set_defaults(func=cmd_dump)
 
     s = sub.add_parser("plot", help="plot a recorded log")
     s.add_argument("csv")

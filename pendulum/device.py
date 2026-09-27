@@ -9,7 +9,7 @@ from pathlib import Path
 
 import serial
 
-LOG_FIELDS = ["t_ms", "state", "th", "psi", "dth", "dpsi", "u", "th_acc", "exec_us"]
+LOG_FIELDS = ["t_ms", "state", "th", "psi", "dth", "dpsi", "u", "th_acc", "exec_us", "vin"]
 BAUD = 921600
 
 
@@ -95,6 +95,27 @@ class Device:
         self.cmd("LOG 0", echo=False)
         return rows
 
+    def dump(self, path: str | Path, timeout: float = 60.0) -> int:
+        """Fetch the on-board recorder (runs made without the USB cable) into a CSV."""
+        self.ser.write(b"DUMP\n")
+        rows = 0
+        end = time.monotonic() + timeout
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(LOG_FIELDS)
+            while time.monotonic() < end:
+                r = self.readline()
+                if not r:
+                    continue
+                if r.startswith("D,"):
+                    w.writerow(r.split(",")[1:])
+                    rows += 1
+                elif r.startswith("# dump end") or r.startswith("# ERR"):
+                    if r.startswith("# ERR"):
+                        print(r)
+                    break
+        return rows
+
     def terminal(self):
         """Interactive console. D-lines are hidden."""
         stop = threading.Event()
@@ -126,6 +147,6 @@ def load_log(path: str | Path) -> dict:
     import numpy as np
 
     data = np.genfromtxt(path, delimiter=",", names=True)
-    log = {k: np.atleast_1d(data[k]) for k in LOG_FIELDS}
+    log = {k: np.atleast_1d(data[k]) for k in data.dtype.names}  # older logs have no vin
     log["t"] = (log["t_ms"] - log["t_ms"][0]) * 1e-3
     return log

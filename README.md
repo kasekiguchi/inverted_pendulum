@@ -133,6 +133,9 @@ uv run pend plot logs/<file>_run.csv
 - `|th| > THLIM`、走行距離 `> XLIM`、指令が 0.3 秒以上上限に張り付く、または I2C エラーで自動停止する。
 - **B ボタン** / `STOP` でいつでも停止できる。
 
+**USB なしで動かす場合**: 電源を入れて約 1.5 秒静止させ（ジャイロバイアス取得）、A ボタンで ARM、立てると開始、B で停止。
+制御中のデータは本体（PSRAM）に直近 60 秒ぶん記録されるので、あとで USB を挿して `uv run pend dump PORT --clear` で取り出す。
+
 ## シリアルコマンド (921600 baud)
 
 | コマンド | 内容 |
@@ -146,6 +149,7 @@ uv run pend plot logs/<file>_run.csv
 | `IMU g f u` | IMU 軸の割り当て (符号付き 1..3) |
 | `SGN l r` | 左右車輪の符号 (±1) |
 | `R` `TRIM` `TC` `TF` `UMAX` `THLIM` `XLIM` `ARMW` `IMAX` | 車輪半径[m], 直立時の傾き[deg], 相補フィルタ時定数[s], 微分フィルタ[s], 速度上限[rad/s], 角度[deg]/走行距離[m]リミット, 開始窓[deg], 最大電流[mA] |
+| `DUMP` / `CLEARLOG` | 本体に記録した直近 60 秒（制御中＋停止後 1 秒）を出力 / 消去。`pend dump PORT` で CSV に保存 |
 | `GET` / `SAVE` | パラメータ表示 / フラッシュ保存 |
 | `INFO` | Roller / IMU の状態表示 |
 | `SPID` / `SPID p i d` | Roller の速度 PID の読み出し / 書き込み（生の値。P/1e5, I/1e7, D/1e5）。`SAVE` すると起動時に再送 |
