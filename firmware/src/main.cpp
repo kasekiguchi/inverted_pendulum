@@ -12,6 +12,7 @@
 #include <Preferences.h>
 #include <Wire.h>
 #include <esp_heap_caps.h>
+#include <esp_system.h>
 
 #include "imu.h"
 #include "remote.h"
@@ -229,6 +230,40 @@ void saveParams() {
   prefs.begin("pendulum", false);
   prefs.putBytes("p", &P, sizeof(Params));
   prefs.end();
+}
+
+// ---- Reset diagnostics ------------------------------------------------------
+// Survives software resets (not power cycles): counts resets that were not a
+// power-on / deliberate restart, e.g. a crash, watchdog or brownout.
+RTC_NOINIT_ATTR uint32_t reset_magic;
+RTC_NOINIT_ATTR uint32_t unexpected_resets;
+esp_reset_reason_t last_reset = ESP_RST_UNKNOWN;
+
+const char* resetReasonName(esp_reset_reason_t r) {
+  switch (r) {
+    case ESP_RST_POWERON: return "power-on";
+    case ESP_RST_EXT: return "reset pin";
+    case ESP_RST_SW: return "software";
+    case ESP_RST_PANIC: return "CRASH (panic)";
+    case ESP_RST_INT_WDT: return "CRASH (int watchdog)";
+    case ESP_RST_TASK_WDT: return "CRASH (task watchdog)";
+    case ESP_RST_WDT: return "CRASH (watchdog)";
+    case ESP_RST_BROWNOUT: return "BROWNOUT (supply dip)";
+    case ESP_RST_DEEPSLEEP: return "deep sleep";
+    default: return "unknown";
+  }
+}
+
+void noteResetReason() {
+  last_reset = esp_reset_reason();
+  if (reset_magic != 0x5EC0DE01 || last_reset == ESP_RST_POWERON) {
+    reset_magic = 0x5EC0DE01;
+    unexpected_resets = 0;
+  }
+  if (last_reset != ESP_RST_POWERON && last_reset != ESP_RST_SW && last_reset != ESP_RST_EXT &&
+      last_reset != ESP_RST_DEEPSLEEP) {
+    ++unexpected_resets;
+  }
 }
 
 // ---- Named parameter sets ------------------------------------------------
@@ -661,6 +696,8 @@ void printParams() {
   Serial.printf("# DRIVE %g %g %g %g %g\n", P.drive_vmax, P.drive_amax, P.drive_yaw, P.drive_jmax, P.drive_lean_deg);
   Serial.printf("# VMIN %g (cutoff %.2f V, vin %.2f V)\n", P.vin_min, vin_cutoff, vin_f);
   Serial.printf("# SET %s\n", active_set[0] ? active_set : "-");
+  Serial.printf("# RESET last %s, unexpected since power-on %lu\n", resetReasonName(last_reset),
+                (unsigned long)unexpected_resets);
   Serial.printf("# SPID %lu %lu %lu\n", (unsigned long)P.speed_pid[0], (unsigned long)P.speed_pid[1],
                 (unsigned long)P.speed_pid[2]);
 }
@@ -915,6 +952,12 @@ void sendAll() {
   sendParams();
   sendSets();
   sendConsts();
+  if (unexpected_resets) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "m,unexpected resets: %lu (last: %s)", (unsigned long)unexpected_resets,
+             resetReasonName(last_reset));
+    remote::sendText(buf);
+  }
 }
 
 // A gain may be scaled but not flipped (the page scales 0..2x the saved value).
@@ -1044,6 +1087,11 @@ void drawLcd() {
   auto& d = M5.Display;
   d.setCursor(0, 0);
   d.printf("%-6s  i2c_err %-4u\n", stateName(state), i2c_errors);
+  if (unexpected_resets) {
+    d.setTextColor(TFT_RED, TFT_BLACK);
+    d.printf("RESET x%lu %-13.13s\n", (unsigned long)unexpected_resets, resetReasonName(last_reset));
+    d.setTextColor(TFT_WHITE, TFT_BLACK);
+  }
   d.printf("th   %+8.2f deg\n", th * RAD_TO_DEG);
   d.printf("thacc%+8.2f deg\n", th_acc * RAD_TO_DEG);
   d.printf("dth  %+8.1f dps\n", x[2] * RAD_TO_DEG);
@@ -1064,6 +1112,13 @@ void drawLcd() {
 }  // namespace
 
 void setup() {
+  // The rollers keep their last speed command across an ESP32 reset (they are
+  // powered separately), so stop them before anything else.
+  Wire.begin(kSda, kScl, kI2cFreq);
+  setOutput(false);
+  Wire.end();
+  noteResetReason();
+
   auto cfg = M5.config();
   cfg.internal_imu = false;  // the IMU is read directly over Wire below
   M5.begin(cfg);
